@@ -1,0 +1,11 @@
+services:
+  machine:
+    build: ./machine
+    privileged: true
+    volumes:
+      - machine-data:/data
+    tty: true
+    stdin_open: true
+
+volumes:
+  machine-data:
