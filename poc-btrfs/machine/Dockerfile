@@ -3,6 +3,7 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y \
     btrfs-progs \
     docker.io \
+    docker-buildx \
     util-linux \
     jq \
     curl \
@@ -11,5 +12,9 @@ RUN apt-get update && apt-get install -y \
 COPY entrypoint.sh /entrypoint.sh
 COPY demo.sh /demo.sh
 RUN chmod +x /entrypoint.sh /demo.sh
+
+# App container build context (built by inner Docker daemon during demo)
+COPY container-init.sh /app-container/container-init.sh
+COPY app-container/Dockerfile /app-container/Dockerfile
 
 ENTRYPOINT ["/entrypoint.sh"]

