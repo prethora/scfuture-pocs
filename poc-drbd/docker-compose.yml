@@ -1,0 +1,39 @@
+networks:
+  drbd-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.20.0.0/24
+
+services:
+  machine-1:
+    build: ./machine
+    privileged: true
+    hostname: machine-1
+    volumes:
+      - ./data/machine-1:/var/lib/machine-data
+    networks:
+      drbd-net:
+        ipv4_address: 10.20.0.11
+    environment:
+      - NODE_ID=machine-1
+      - NODE_IP=10.20.0.11
+      - PEER_IP=10.20.0.12
+      - ROLE=primary
+      - RUN_DEMO=true
+
+  machine-2:
+    build: ./machine
+    privileged: true
+    hostname: machine-2
+    volumes:
+      - ./data/machine-2:/var/lib/machine-data
+    networks:
+      drbd-net:
+        ipv4_address: 10.20.0.12
+    environment:
+      - NODE_ID=machine-2
+      - NODE_IP=10.20.0.12
+      - PEER_IP=10.20.0.11
+      - ROLE=secondary
+      - RUN_DEMO=false
