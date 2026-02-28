@@ -1,0 +1,41 @@
+#cloud-config
+
+# Backblaze B2 Backup & Restore PoC — Server provisioning
+# Installs DRBD 9, Docker, btrfs-progs, zstd, b2 CLI on Ubuntu 24.04
+
+debconf_selections: |
+  postfix postfix/main_mailer_type select No configuration
+
+apt:
+  sources:
+    linbit:
+      source: "ppa:linbit/linbit-drbd9-stack"
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - drbd-utils
+  - drbd-dkms
+  - linux-headers-generic
+  - btrfs-progs
+  - docker.io
+  - docker-buildx
+  - util-linux
+  - kmod
+  - jq
+  - curl
+  - zstd
+  - pipx
+  - python3-pip
+
+runcmd:
+  - apt-get install -y linux-headers-$(uname -r)
+  - dkms autoinstall
+  - modprobe drbd
+  - systemctl enable docker
+  - systemctl start docker
+  - mkdir -p /data/images /mnt/users/alice
+  - pipx install b2 || pip3 install --break-system-packages b2[full]
+  - echo 'export PATH="$PATH:/root/.local/bin"' >> /root/.bashrc
+  - echo "cloud-init provisioning complete" > /var/log/b2-poc-ready

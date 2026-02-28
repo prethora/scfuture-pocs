@@ -588,3 +588,345 @@ To manage infrastructure manually:
 ./infra.sh status   # Check state
 ./infra.sh down     # Destroy everything
 ```
+
+---
+
+---
+
+# PoC 3: Backblaze B2 Backup & Restore (`poc-backblaze/`)
+
+## Goal
+
+Build a PoC demonstrating the third and final tier of data safety: cold backup and restore via Backblaze B2. This proves the complete recovery path: `btrfs send → zstd compress → B2 upload → [fleet copies deleted] → B2 download → zstd decompress → btrfs receive → workspace from snapshot → containers run → DRBD bipod formed`. This is the "both machines die" scenario and the "reactivation after eviction" scenario from the architecture.
+
+After this PoC, every data safety scenario in the architecture has a proven recovery path.
+
+## Environment
+
+Two Hetzner Cloud CX23 servers at `nbg1` (Nuremberg), Ubuntu 24.04, private network `10.0.0.0/24`. Same as PoC 2 but with additional B2 CLI tooling. Demo runs **locally on macOS** and SSHes into both machines (unlike PoC 2 where demo.sh ran on machine-1).
+
+## File Structure
+
+```
+poc-backblaze/
+├── run.sh                       # Main: validate env → infra up → demo → teardown
+├── infra.sh                     # Hetzner lifecycle: up / down / status
+├── cloud-init.yaml              # Server provisioning (DRBD 9, Docker, btrfs, zstd, b2)
+├── scripts/
+│   ├── demo.sh                  # 13-phase demo (phases 0-12), 65 checks
+│   ├── container-init.sh        # Device-mount init script (from PoC 1/2)
+│   └── app-container/
+│       └── Dockerfile           # Alpine + btrfs-progs (from PoC 1/2)
+```
+
+## Issues Encountered & Fixes
+
+### Issue 18: `du -b` reports apparent size, not disk usage
+
+**Problem:** Phase 1 checked sparse file efficiency using `du -b` to get actual disk usage, but `du -b` (`--apparent-size --block-size=1`) reports the **apparent** file size (same as `stat -c%s`), not the actual on-disk blocks. The sparse check always failed because apparent == actual.
+
+**Fix:** Changed to `du` (without `-b`) which reports actual disk blocks in KB, then multiplied by 1024 to get bytes. Now correctly shows apparent=2048MB vs actual=4MB.
+
+### Issue 19: B2 CLI v4 requires `b2://` URI for `b2 ls`
+
+**Problem:** `b2 ls --recursive '$BUCKET_NAME'` failed with `error: argument B2_URI: Invalid B2 URI`. The B2 CLI v4 changed `b2 ls` to require a `b2://` prefixed URI.
+
+**Fix:** Changed all `b2 ls` calls from `b2 ls --recursive '$BUCKET_NAME'` to `b2 ls --recursive 'b2://$BUCKET_NAME'`. Note: `b2 file upload` and `b2 file download` do NOT need this prefix — they take the bucket name as a positional argument. Only `b2 ls` and `b2 rm` use the URI format.
+
+### Issue 20: DRBD needs block devices, not regular files
+
+**Problem:** The master-prompt3.md spec said to use `disk /data/images/alice.img` directly in the DRBD resource config. This failed: `'/data/images/alice.img' is not a block device!`. DRBD requires block devices for its backing storage.
+
+**Root cause:** The master-prompt3.md was generated from a session that didn't have full context of the `poc-drbd` implementation details. In `poc-drbd`, loop devices are always used (`losetup --find --show`), and the DRBD config references the loop device (`/dev/loop0`), never the raw file.
+
+**Fix:** Added `losetup` calls in Phase 10 to create loop devices on both machines before writing the DRBD config. The config now uses `$DRBD_LOOP1` / `$DRBD_LOOP2` paths.
+
+### Issue 21: `drbdadm create-md` fails on image with existing Btrfs data
+
+**Problem:** On machine-2 (which has restored Btrfs data from the cold restore), `drbdadm create-md` detected existing data and prompted for confirmation. The `yes yes |` pipe wasn't sufficient because the interactive prompt behaves differently over SSH.
+
+**Fix:** Added `--force` flag: `yes yes | drbdadm create-md --force alice`. In `poc-drbd`, both images were created fresh/empty so this never occurred.
+
+### Issue 22: DRBD internal metadata overwrites Btrfs superblock
+
+**Problem:** With `meta-disk internal`, DRBD writes its metadata at the **end** of the backing device. Since the Btrfs filesystem was created using the full 2GB loop device, DRBD's `create-md --force` overwrites the last ~128KB of the Btrfs filesystem. After DRBD sync and mount, the Btrfs superblock was corrupted: `mount /dev/drbd0: wrong fs type, bad option, bad superblock on /dev/drbd0`.
+
+**Root cause:** In `poc-drbd`, DRBD is set up on a blank device BEFORE `mkfs.btrfs` runs. So DRBD reserves the end-of-disk space for metadata first, and Btrfs is created on the (slightly smaller) `/dev/drbd0` device. In this PoC, the flow is reversed: Btrfs data exists FIRST (from cold restore), and DRBD is layered on top afterward. The internal metadata writes into space that Btrfs already uses.
+
+**Fix:** Switched from `meta-disk internal` to **external metadata devices**. Each machine creates a separate 128MB image file (`/data/images/alice-drbd-meta.img`), loop-mounts it, and uses it as `meta-disk /dev/loop1` in the DRBD config. This keeps DRBD metadata completely separate from the Btrfs data, preserving the filesystem integrity.
+
+**Key learning:** When retrofitting DRBD onto an existing data-bearing image (as happens in cold restore → bipod formation), you MUST use external metadata. The `internal` metadata option only works safely when DRBD is set up BEFORE the filesystem is created.
+
+## B2 Bucket Structure
+
+```
+b2://poc-backblaze-{random}/users/alice/
+  ├── layer-000.btrfs.zst              (full send of base snapshot, ~1.2KB)
+  ├── layer-001.btrfs.zst              (incremental from layer-000, ~838B)
+  ├── auto-backup-latest.btrfs.zst     (incremental from layer-001)
+  └── manifest.json                     (snapshot chain metadata)
+```
+
+## Successful Run — 64/64 Checks Passed
+
+```
+═══ Phase 0: Prerequisites ═══
+  [CHECK 01] PASS: DRBD module loaded (machine-1)
+  [CHECK 02] PASS: DRBD module loaded (machine-2)
+  [CHECK 03] PASS: Docker running (machine-1)
+  [CHECK 04] PASS: Docker running (machine-2)
+  [CHECK 05] PASS: btrfs + zstd + jq available (machine-1)
+  [CHECK 06] PASS: btrfs + zstd + jq available (machine-2)
+  [CHECK 07] PASS: B2 CLI available (machine-1)
+  [CHECK 08] PASS: B2 CLI available (machine-2)
+  [CHECK 09] PASS: B2 authorized (machine-1)
+  [CHECK 10] PASS: B2 bucket created
+
+═══ Phase 1: Create User World on Machine-1 ═══
+  [CHECK 11] PASS: Image sparse: apparent 2048MB, actual 4MB
+  [CHECK 12] PASS: Btrfs mounted at /mnt/users/alice
+  [CHECK 13] PASS: Seed data written
+  [CHECK 14] PASS: layer-000 snapshot created (read-only)
+  [CHECK 15] PASS: Workspace subvolume exists
+
+═══ Phase 2: Full Backup — layer-000 to B2 ═══
+  [CHECK 16] PASS: btrfs send + zstd compression succeeded
+  [CHECK 17] PASS: layer-000 uploaded to B2 (1232 bytes)
+  [CHECK 18] PASS: manifest.json uploaded
+  [CHECK 19] PASS: layer-000 verified in B2 bucket
+
+═══ Phase 3: Simulate Agent Work + Create layer-001 ═══
+  [CHECK 20] PASS: New data written to workspace
+  [CHECK 21] PASS: layer-001 snapshot created
+  [CHECK 22] PASS: layer-001 contains new data
+
+═══ Phase 4: Incremental Backup — layer-001 to B2 ═══
+  [CHECK 23] PASS: Incremental send succeeded
+  [CHECK 24] PASS: Incremental smaller than full (838 < 1232)
+  [CHECK 25] PASS: layer-001 uploaded to B2
+  [CHECK 26] PASS: manifest.json has 2 chain entries
+
+═══ Phase 5: More Agent Work + Auto-Backup ═══
+  [CHECK 27] PASS: auto-backup-latest snapshot created
+  [CHECK 28] PASS: auto-backup-latest uploaded to B2
+  [CHECK 29] PASS: manifest.json has 3 chain entries
+  [CHECK 30] PASS: Chain ordering correct: layer-000 → layer-001 → auto-backup-latest
+
+═══ Phase 6: Verify B2 Bucket Contents ═══
+  [CHECK 31] PASS: Bucket has 4 files (expected 4)
+  [CHECK 32] PASS: manifest.json is valid JSON
+  [CHECK 33] PASS: manifest.json chain has 3 entries
+  [CHECK 34] PASS: All chain entries have size_bytes > 0
+  [CHECK 35] PASS: All manifest keys match actual B2 objects
+
+═══ Phase 7: Simulate Total Loss — Destroy Machine-1 Data ═══
+  [CHECK 36] PASS: /mnt/users/alice is not mounted
+  [CHECK 37] PASS: /data/images/alice.img destroyed
+  [CHECK 38] PASS: Data irrecoverable on machine-1 — only B2 remains
+
+═══ Phase 8: Cold Restore on Machine-2 ═══
+  [CHECK 39] PASS: Fresh Btrfs created on machine-2
+  [CHECK 40] PASS: layer-000 received
+  [CHECK 41] PASS: layer-001 received (incremental)
+  [CHECK 42] PASS: auto-backup-latest received (incremental)
+  [CHECK 43] PASS: All snapshots + workspace present (4 subvolumes)
+  [CHECK 44] PASS: config.json: version=1.2
+  [CHECK 45] PASS: MEMORY.md: contains Session 1 and Session 2
+  [CHECK 46] PASS: apps/core/index.html intact
+  [CHECK 47] PASS: apps/email/inbox.html: has boss's email
+  [CHECK 48] PASS: apps/budget/ledger.json: has 2 transactions
+  [CHECK 49] PASS: apps/budget/alerts.json: has threshold alert
+  [CHECK 50] PASS: layer-000 snapshot accessible (config version=1.0)
+
+═══ Phase 9: Start Containers on Machine-2 ═══
+  [CHECK 51] PASS: Container alice-core running on machine-2
+  [CHECK 52] PASS: Container reads restored config.json (version=1.2)
+  [CHECK 53] PASS: Container reads restored MEMORY.md (has Session 2)
+
+═══ Phase 10: Form Bipod from Restored Data ═══
+  [CHECK 54] PASS: DRBD config written on both machines
+  [CHECK 55] PASS: DRBD metadata created on both
+  [CHECK 56] PASS: machine-2 promoted to primary
+  [CHECK 57] PASS: DRBD sync complete — both nodes UpToDate
+  [CHECK 58] PASS: Btrfs mounted on /dev/drbd0 (machine-2)
+
+═══ Phase 11: Verify Bipod + Data Integrity ═══
+  [CHECK 59] PASS: config.json intact on DRBD (version=1.2)
+  [CHECK 60] PASS: MEMORY.md intact on DRBD (has Session 2)
+  [CHECK 61] PASS: New snapshot created on DRBD-backed Btrfs
+  [CHECK 62] PASS: All subvolumes present (5 total: 3 snapshots + workspace + post-restore)
+  [CHECK 63] PASS: btrfs receive correctly rejected incremental without parent
+  [CHECK 64] PASS: Chain ordering in manifest.json is mandatory — confirmed
+
+════════════════════════════════════════════════
+ Backblaze B2 Backup & Restore PoC — Results
+════════════════════════════════════════════════
+  Passed: 64
+  Failed: 0
+  ALL CHECKS PASSED
+```
+
+## What Was Proven
+
+1. **Full backup to B2** — `btrfs send → zstd compress → B2 file upload` of initial snapshot
+2. **Incremental backups** — delta sends using parent snapshot; incremental smaller than full (838 < 1232 bytes)
+3. **Manifest-tracked snapshot chain** — JSON manifest tracks chain ordering, parent relationships, file sizes
+4. **Total data loss survival** — all data on machine-1 destroyed; only B2 copy remains
+5. **Cold restore** — `B2 download → zstd decompress → btrfs receive` of full chain (3 layers applied in order)
+6. **Complete data integrity** — ALL data from ALL phases survives: config.json (version 1.2), MEMORY.md (2 sessions), email inbox, budget ledger (2 transactions), budget alerts
+7. **Historical snapshot access** — layer-000 snapshot accessible with original data (config version 1.0)
+8. **Containers run on restored data** — Docker container starts, reads all restored files correctly
+9. **DRBD bipod from restored data** — machine-2 (with restored data) becomes primary, machine-1 (empty) becomes secondary, full sync completes
+10. **Btrfs on DRBD works post-restore** — new snapshots can be created on the DRBD-backed filesystem
+11. **Chain ordering enforced** — out-of-order `btrfs receive` correctly fails without parent snapshot
+
+## Iterations Required
+
+5 attempts to get all 64 checks passing:
+
+| Attempt | Result | Issue |
+|---------|--------|-------|
+| 1 | 3 FAIL, exit at Phase 6 | `du -b` sparse check wrong; `b2 ls` missing `b2://` prefix; `set -e` exit |
+| 2 | 55 PASS, exit at Phase 10 | Fixed sparse + b2 ls; DRBD config used raw file path instead of loop device |
+| 3 | 55 PASS, exit at Phase 10 | Fixed loop devices; `create-md` failed on data-bearing image (no --force) |
+| 4 | 57 PASS, exit at Phase 10 | Fixed --force; DRBD internal metadata overwrote Btrfs superblock |
+| 5 | **64 PASS** | Fixed: external DRBD metadata device |
+
+## How to Run (poc-backblaze)
+
+```bash
+export HCLOUD_TOKEN="your-hetzner-api-token"
+export B2_KEY_ID="your-backblaze-key-id"
+export B2_APP_KEY="your-backblaze-application-key"
+
+cd poc-backblaze
+./run.sh
+```
+
+---
+
+---
+
+# Patch 3.1: Fix Cold Restore Ordering — DRBD Before Filesystem
+
+## Motivation
+
+The original PoC 3 used a suboptimal approach for cold restore → bipod formation. The flow was:
+
+1. Phase 8: Restore Btrfs data onto a plain loop device (no DRBD)
+2. Phase 9: Start containers on the raw loop device
+3. Phase 10: Retrofit DRBD on top of existing data — requiring external metadata devices
+
+This created two problems:
+- **External metadata complexity** — 128MB `alice-drbd-meta.img` files, extra loop devices, `--force` on `create-md`
+- **Different code path** — cold restore used a different block device stack than normal provisioning (external metadata vs. internal)
+
+## The Fix
+
+Reorder so DRBD is set up on **blank devices FIRST** (with `meta-disk internal`, same as PoC 2), then format Btrfs on `/dev/drbd0`, then `btrfs receive` the snapshots. All `btrfs receive` writes replicate to machine-1 via DRBD in real-time.
+
+New flow:
+```
+sparse file → loop device → DRBD (meta-disk internal) → /dev/drbd0 → mkfs.btrfs → btrfs receive
+```
+
+No external metadata files. No `--force` on `create-md`. No special cases. One architecture for all paths.
+
+## What Changed
+
+### Phase restructuring
+
+| Phase | Before (v3.0) | After (v3.1) |
+|-------|---------------|--------------|
+| 8 | Cold restore (Btrfs only, machine-2) | Cold restore WITH DRBD (both machines) |
+| 9 | Start containers (raw loop device) | Verify DRBD sync complete |
+| 10 | Form bipod (retrofit DRBD, external metadata) | Start containers (on /dev/drbd0) |
+| 11 | Verify bipod + data | Verify bipod + data (unchanged) |
+| 12 | Negative test | Negative test (unchanged) |
+
+### New Phase 8 flow (merged cold restore + DRBD)
+1. Create blank 2G images on **both** machines
+2. Loop devices on both
+3. DRBD config with `meta-disk internal` (same as poc-drbd)
+4. `drbdadm create-md` — no `--force` needed (blank images)
+5. `drbdadm up` on both, promote machine-2
+6. `mkfs.btrfs -f /dev/drbd0`
+7. Mount, download manifest, `btrfs receive` all 3 snapshots
+8. Create workspace, verify data integrity
+9. All writes replicate to machine-1 via DRBD Protocol A in real-time
+
+### New Phase 9 — DRBD sync verification
+- Wait for machine-1 (Secondary) to reach UpToDate
+- Verify roles: machine-2 Primary, machine-1 Secondary
+
+### New Phase 10 — Containers use `/dev/drbd0`
+- Container starts with `--device /dev/drbd0` (not raw loop device)
+
+### Removed
+- `alice-drbd-meta.img` files (128MB external metadata images)
+- Extra loop devices for metadata
+- `--force` flag on `drbdadm create-md`
+- Unmount/re-mount dance between old Phases 9→10
+
+## Issues Encountered
+
+### Issue 23: DRBD status `peer-role` vs `role` format
+
+**Problem:** Phase 9's DRBD role verification checked for `peer-role:Secondary` in the `drbdadm status` output. The actual output format shows the peer's role as `poc-b2-machine-1 role:Secondary` (under the peer name), not as `peer-role:Secondary`.
+
+**Fix:** Changed grep pattern from `peer-role:Secondary` to `poc-b2-machine-1 role:Secondary`.
+
+## Iterations
+
+2 attempts:
+
+| Attempt | Result | Issue |
+|---------|--------|-------|
+| 1 | 64/65 PASS, 1 FAIL | `peer-role:Secondary` grep pattern wrong (Issue 23) |
+| 2 | **65/65 PASS** | Fixed grep pattern |
+
+## Result — 65/65 Checks Passed
+
+```
+═══ Phase 0: Prerequisites ═══                     — 10 checks (DRBD, Docker, tools, B2)
+═══ Phase 1: Create User World on Machine-1 ═══    — 5 checks
+═══ Phase 2: Full Backup — layer-000 to B2 ═══     — 4 checks
+═══ Phase 3: Simulate Agent Work + Create layer-001 — 3 checks
+═══ Phase 4: Incremental Backup — layer-001 to B2  — 4 checks
+═══ Phase 5: More Agent Work + Auto-Backup ═══     — 4 checks
+═══ Phase 6: Verify B2 Bucket Contents ═══         — 5 checks
+═══ Phase 7: Simulate Total Loss — Destroy Data ═══ — 3 checks
+═══ Phase 8: Cold Restore with DRBD ═══            — 15 checks (DRBD setup + restore + integrity)
+═══ Phase 9: Verify DRBD Sync ═══                  — 3 checks (sync, Primary, Secondary)
+═══ Phase 10: Start Containers on Machine-2 ═══    — 3 checks
+═══ Phase 11: Verify Bipod + Data Integrity ═══    — 4 checks
+═══ Phase 12: Negative Test — Chain Ordering ═══   — 2 checks
+
+  Passed: 65
+  Failed: 0
+  ALL CHECKS PASSED
+```
+
+## Key Outcome
+
+The cold restore path now uses the **identical block device stack** as normal provisioning:
+
+```
+Normal provisioning (poc-drbd):
+  sparse → loop → DRBD (internal) → /dev/drbd0 → mkfs.btrfs → subvolumes
+
+Cold restore (poc-backblaze v3.1):
+  sparse → loop → DRBD (internal) → /dev/drbd0 → mkfs.btrfs → btrfs receive → subvolumes
+```
+
+One architecture. No special cases. Issue 22 (external metadata workaround) is no longer needed.
+
+## Resource Teardown Verified
+
+After each run:
+- `poc-b2-machine-1` — deleted
+- `poc-b2-machine-2` — deleted
+- `poc-backblaze-net` — deleted
+- `b2-poc-key` — deleted
+- B2 bucket — emptied and deleted
+- Pre-existing `prethora-ttyd-bd7508a6` — untouched
