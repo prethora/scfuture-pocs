@@ -930,3 +930,183 @@ After each run:
 - `b2-poc-key` — deleted
 - B2 bucket — emptied and deleted
 - Pre-existing `prethora-ttyd-bd7508a6` — untouched
+
+---
+
+# Layer 4.1: Machine Agent PoC
+
+## Goal
+
+Build a Go HTTP server (machine agent) that wraps the proven block device stack behind idempotent API endpoints. First Go code in the project. A bash test harness on macOS drives the agent through the full lifecycle via HTTP calls, playing the role that a coordinator will play in Layer 4.2.
+
+## What We Built
+
+```
+poc-coordinator/
+├── go.mod                              (module: poc-coordinator, Go 1.22, zero deps)
+├── Makefile                            (build/deploy/test/clean)
+├── cmd/
+│   └── machine-agent/
+│       └── main.go                     # Entry point, env config, startup
+├── internal/
+│   └── machineagent/
+│       ├── server.go                   # HTTP server, 13 routes, JSON helpers, system info
+│       ├── images.go                   # Sparse image create, loop device attach, idempotent
+│       ├── drbd.go                     # DRBD lifecycle + status parser (multi-format)
+│       ├── btrfs.go                    # Format DRBD device, subvolume + snapshot creation
+│       ├── containers.go              # Docker device-mount pattern start/stop/status
+│       ├── state.go                    # In-memory state map, system discovery on startup
+│       ├── cleanup.go                  # Per-user + full machine teardown
+│       └── exec.go                     # Command execution with stdout/stderr capture
+├── container/
+│   ├── Dockerfile                      # Alpine + btrfs-progs + appuser
+│   └── container-init.sh              # Mount subvol → drop to appuser → exec workload
+├── scripts/
+│   ├── run.sh                          # Full lifecycle: infra → deploy → test → teardown
+│   ├── common.sh                       # IP discovery, SSH/API helpers, check framework
+│   ├── infra.sh                        # Hetzner CX23 creation/deletion + private network
+│   ├── deploy.sh                       # Cross-compile + SCP + hostname + container build
+│   ├── test_suite.sh                  # 9 phases, 66 checks
+│   └── cloud-init/
+│       └── fleet.yaml                  # DRBD 9 + Docker + btrfs-progs + systemd unit
+└── bin/
+    └── machine-agent                   # Cross-compiled Linux/amd64 binary
+```
+
+## Architecture
+
+```
+macOS (test harness — bash scripts)
+  │
+  ├── HTTP → machine-1 (Hetzner CX23, public IP, port 8080)
+  └── HTTP → machine-2 (Hetzner CX23, public IP, port 8080)
+
+Each machine runs:
+  Go HTTP server (machine-agent) on :8080
+  └── Wraps: losetup, drbdadm, mkfs.btrfs, btrfs subvolume, docker run
+
+Hetzner private network (10.0.0.0/24):
+  machine-1 ←──DRBD──→ machine-2
+  Per-user DRBD resources on separate ports (7900+)
+```
+
+## API Endpoints (13 routes)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | /status | Machine health + per-user resource state |
+| POST | /images/{user_id}/create | Sparse image + loop device |
+| DELETE | /images/{user_id} | Full user teardown (reverse order) |
+| POST | /images/{user_id}/drbd/create | Write config + create-md + up |
+| POST | /images/{user_id}/drbd/promote | Promote to Primary (--force) |
+| POST | /images/{user_id}/drbd/demote | Demote to Secondary |
+| GET | /images/{user_id}/drbd/status | Parse DRBD status (multi-format) |
+| DELETE | /images/{user_id}/drbd | Down + remove config |
+| POST | /images/{user_id}/format-btrfs | mkfs.btrfs + workspace subvol + snapshot |
+| POST | /containers/{user_id}/start | Device-mount container start |
+| POST | /containers/{user_id}/stop | Container stop + rm |
+| GET | /containers/{user_id}/status | Container running/exists |
+| POST | /cleanup | Full machine cleanup |
+
+## Test Results — 66/66 Checks Passing
+
+```
+Phase 0: Prerequisites                          [8/8]
+Phase 1: Single User Provisioning — Full Stack  [10/10]
+Phase 2: Device-Mount Verification              [5/5]
+Phase 3: Data Write + DRBD Replication          [4/4]
+Phase 4: Failover via API                       [8/8]
+Phase 5: Idempotency Tests                      [8/8]
+Phase 6: Full Teardown                          [8/8]
+Phase 7: Multi-User Density (3 users)           [9/9]
+Phase 8: Status Endpoint Accuracy               [6/6]
+═══════════════════════════════════════════════════
+ALL PHASES COMPLETE: 66/66 checks passed
+═══════════════════════════════════════════════════
+```
+
+## Issues Encountered & Fixes
+
+### Issue 1: SSH key path (macOS)
+
+**Problem:** `infra.sh` referenced `~/.ssh/id_ed25519.pub` which didn't exist.
+**Fix:** Changed to `~/.ssh/id_rsa.pub` which is the available key.
+
+### Issue 2: DRBD status parser — extra tokens on status lines
+
+**Problem:** DRBD 9 status output includes extra key:value pairs on the same line:
+```
+disk:UpToDate open:no
+```
+The initial parser treated the entire line as the disk state value, producing `"disk_state":"UpToDate open:no"`.
+
+**Fix:** Rewrote parser to be token-based — split each line into space-separated tokens and extract known `key:value` prefixes individually. Now correctly yields `"disk_state":"UpToDate"`.
+
+### Issue 3: DRBD sync requires Primary first
+
+**Problem:** Test harness waited for DRBD sync (UpToDate/UpToDate) BEFORE promoting either side. On a fresh DRBD resource, both sides start as Secondary/Inconsistent — sync never starts without a Primary.
+
+**Fix:** Moved the promote call before the sync wait loop. After `drbdadm primary --force`, initial full sync begins and the wait loop succeeds.
+
+### Issue 4: AppArmor blocks mount inside containers
+
+**Problem:** On real Hetzner Ubuntu 24.04 machines, `mount` inside the container fails with "Permission denied" even with `--cap-add SYS_ADMIN`. AppArmor's default Docker profile restricts mount syscalls. In PoC 1 (DinD), AppArmor was not active inside the privileged outer container, so this wasn't seen.
+
+**Fix:** Added `--security-opt apparmor=unconfined` to the `docker run` command. The container already drops all caps except SYS_ADMIN (for mount) and drops to unprivileged user after init, so AppArmor confinement is redundant here.
+
+### Issue 5: `declare -A` not supported on macOS bash 3.2
+
+**Problem:** macOS ships bash 3.2 which doesn't support associative arrays (`declare -A`). Phase 7's multi-user test used associative arrays to track loop devices per user.
+
+**Fix:** Replaced associative arrays with simple variables. Inline the loop device capture directly into the DRBD config construction within the same loop iteration.
+
+### Issue 6: `docker exec` runs as root, not PID 1's user
+
+**Problem:** The "running as appuser" check used `docker exec alice-agent id -un` which returns `root` because `docker exec` defaults to root user, not the container's PID 1 user.
+
+**Fix:** Changed check to use `docker top` which shows the host-visible process list. On the host, the user shows as UID `1000` (appuser's UID) rather than `root`, confirming the workload runs unprivileged.
+
+### Issue 7: Cleanup must handle DRBD holding loop devices
+
+**Problem:** Cleanup failed to release loop devices because DRBD was still using them as backing devices. `losetup -d` fails when the loop device has holders (DRBD). The cleanup function in Go removed the DRBD config file before calling `drbdadm down`, which then couldn't find the resource.
+
+**Fix:** The cleanup Go code calls `drbdadm down` before removing the config file. For the full machine cleanup, it also handles the case where a Docker container holds a mount on the DRBD device (which prevents DRBD from going down).
+
+## Key Learnings
+
+### 1. DRBD 9 Status Output Is Token-Based
+
+DRBD 9 status lines contain multiple space-separated `key:value` tokens per line. A line like `disk:UpToDate open:no` has two tokens. Parsers must split on spaces and match by prefix, not treat the whole line as a single value.
+
+### 2. AppArmor on Real Machines vs DinD
+
+PoC 1 ran inside a privileged DinD container where AppArmor was inactive. On real Ubuntu 24.04 servers, Docker's default AppArmor profile restricts `mount` even with `CAP_SYS_ADMIN`. For the device-mount pattern, `--security-opt apparmor=unconfined` is required.
+
+### 3. DRBD Initial Sync Needs a Primary
+
+A fresh DRBD resource starts with both sides Secondary/Inconsistent. No sync occurs until one side is promoted to Primary with `--force`. Orchestration must promote before waiting for sync.
+
+### 4. Idempotent API Design Works
+
+Every endpoint was safe to call multiple times — the test harness proved this across images, DRBD, Btrfs format, containers, and cleanup. Critical for crash recovery in later layers.
+
+### 5. Device-Mount Pattern Works on Real Servers
+
+The production container isolation pattern (block device via `--device`, mount inside container, drop to unprivileged user) works correctly on real Hetzner servers with DRBD devices, not just loop devices in DinD.
+
+### 6. Failover via API Is Clean
+
+Stop container → demote DRBD → promote other side → start container. No host mount needed. Data survives. The device-mount pattern eliminates the need for host-side Btrfs mounts during normal operation.
+
+### 7. Multi-User Density Confirmed
+
+3 users on the same machine pair with separate DRBD resources, ports, minors — no resource collisions. Stopping one user's container doesn't affect others.
+
+## Resource Teardown Verified
+
+After the run:
+- `poc41-machine-1` — deleted
+- `poc41-machine-2` — deleted
+- `poc41-net` — deleted
+- `poc41` SSH key — deleted
+- Pre-existing servers — untouched
