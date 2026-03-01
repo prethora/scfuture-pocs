@@ -1632,8 +1632,15 @@ The original test checked all 3 users for a 'stale' bipod on fleet-1, but placem
      Graceful shutdown (context cancel → HTTP drain → DB close)
      See detailed Layer 4.6 Preview section below for original design intelligence
 
-🔲 Layer 5: Live migration
-     Pause/promote/unpause for rebalancing
+🔲 Layer 5.1: Tripod primitive + manual migration
+     Add 3rd DRBD node to running 2-node resource (temporary tripod)
+     Coordinator-driven migration orchestration with operation tracking + crash recovery
+     Test: manual API trigger, data integrity, bipod shift verification
+
+🔲 Layer 5.2: Rebalancer + machine drain
+     Rebalancer goroutine (detect imbalance, trigger migrations automatically)
+     Machine drain API (migrate all users off a machine for planned maintenance)
+     Test: provoke imbalance, verify auto-rebalancing, test drain scenario
 
 🔲 Layer 6+: Agent integration, Telegram gateway, credential proxy,
      marketplace, SDK, metering, dashboard...
@@ -2598,6 +2605,138 @@ In priority order:
 
 ---
 
+### Layer 5 Preview: Live Migration
+
+#### Context & Design Philosophy
+
+Live migration moves a running user's world from one machine to another with minimal downtime. Use cases: rebalancing overloaded machines, planned maintenance (draining a machine before taking it offline), and bipod reshaping (moving one side of a bipod to a better-placed machine).
+
+**Key constraint: we don't control what's running inside the container.** The user has an AI agent that builds their world — it may run HTTP servers, databases, open source projects, custom applications. Anything could be running at any time. We cannot expect arbitrary software to support a "prepare to migrate" signal or a freeze/thaw protocol. The platform contract is simpler: **handle SIGTERM gracefully, same as you would for a server reboot.**
+
+This is a reasonable contract because:
+- The agent already operates within a well-defined platform contract (SDKs, primitives, system knowledge)
+- "Handle SIGTERM" is just another item in that contract
+- Open source projects onboarded to the platform will be adapted to fit the system anyway (this is part of the onboarding process)
+- Most well-written servers already handle SIGTERM; for those that don't, a wrapper script handles it
+- Every cloud VM already makes this same promise (maintenance reboots happen)
+
+#### Why Not `docker pause`?
+
+The original v3 architecture designed migration around `docker pause` (cgroups freezer) + `fsfreeze` for sub-second downtime. We rejected this for several reasons:
+
+1. **`docker pause` freezes processes mid-instruction** — no SIGTERM, no signal handlers, no graceful shutdown. In-memory state is frozen but cannot be transferred to the destination machine (that would require CRIU checkpoint/restore, which is fragile and not production-ready).
+2. **`fsfreeze` doesn't work with device-mount** — our containers mount Btrfs internally via `--device /dev/drbdN`. The host has no mount to freeze. We'd need to enter the container's mount namespace, but the container is paused.
+3. **After pause, we must start a fresh container on the destination anyway** — so processes restart regardless. The only question is whether they get a clean SIGTERM or a hard kill. SIGTERM is strictly better.
+
+#### Migration Protocol (Device-Mount Pattern)
+
+```
+Starting state: bipod on fleet-1 (primary) + fleet-5 (secondary)
+Target: move primary to fleet-3
+
+Phase 1 — Pre-sync (transparent, no downtime):
+  1. Create empty image on fleet-3
+  2. Configure DRBD: add fleet-3 as 3rd node (temporary tripod)
+  3. DRBD initial sync from fleet-1 to fleet-3
+  4. Wait for sync to complete (fleet-3 now has full copy)
+  User's container keeps running throughout. Sync is transparent.
+
+Phase 2 — Switchover (~5-15s downtime):
+  5. docker stop on fleet-1 (SIGTERM → grace period → SIGKILL)
+     Processes get SIGTERM, finish current requests, close connections,
+     flush buffers, shut down cleanly. Default 10s grace before SIGKILL.
+  6. Demote DRBD on fleet-1 (secondary)
+  7. Promote DRBD on fleet-3 (primary)
+  8. docker start on fleet-3 (container starts with same /dev/drbdN, same data)
+     All services restart from persisted state on the same filesystem.
+
+Phase 3 — Cleanup:
+  9. Remove fleet-1 from DRBD config (disconnect, destroy, delete image)
+  10. Update bipod in store: fleet-1 → fleet-3
+  Bipod is now: fleet-3 (primary) + fleet-5 (secondary)
+```
+
+**Downtime window:** SIGTERM grace period (up to 10s) + demote/promote (~100ms) + container start (~1-5s) = **~5-15 seconds**. During this window, the user's HTTP servers are unreachable and TCP connections break. On restart, everything comes back from the same Btrfs filesystem. Telegram/WhatsApp messages queue and the agent catches up.
+
+**Data safety:** Before Phase 2, DRBD has fully synced fleet-3. After `docker stop`, all filesystem writes have been flushed (process shutdown + kernel flush). Btrfs COW guarantees on-disk consistency. The data exists on 3 machines at the moment of switchover. After cleanup, it's back to 2 (fleet-3 + fleet-5). At no point is data at risk.
+
+#### The Key Unknown: Temporary Tripod (3-Node DRBD)
+
+The one primitive we haven't built or tested: **adding a 3rd DRBD node to a running 2-node resource.**
+
+DRBD 9 supports N nodes natively, but we've only ever configured 2-node resources. The critical questions:
+
+1. **Can `drbdadm adjust` add a 3rd node to a running resource?** — This is the zero-downtime path. Rewrite the `.res` config file to include the 3rd node, run `drbdadm adjust`, DRBD picks up the new config and connects to the 3rd node. This is exactly how reformation works for *replacing* a node — but *adding* a node is different.
+2. **If adjust doesn't work, what's the fallback?** — Possibly: disconnect, rewrite config, `drbdadm down`, `drbdadm up`, `drbdadm primary --force`, reconnect. This requires stopping the container briefly during reconfiguration (similar to the reformation fallback path). Acceptable but less elegant.
+3. **Does the 3-node sync work correctly?** — Primary replicates to both secondaries simultaneously. Need to verify that sync progress is reported correctly and that `UpToDate` on the new node means a full copy.
+4. **Removing a node from a 3-node resource** — After migration, we remove the old primary (now demoted to secondary). Does `drbdadm adjust` handle this cleanly? Or do we need disconnect + reconfigure?
+
+**This is why Layer 5 is split into two sub-layers.** The tripod primitive is where the risk lives. If it works cleanly via `drbdadm adjust`, everything else is straightforward. If it doesn't, we need to find an alternative approach before building the rebalancer on top.
+
+#### Layer 5.1 — Tripod Primitive & Manual Migration
+
+**Goal:** Build and prove the live migration primitive, triggered manually via API.
+
+**Machine agent changes:**
+- DRBD config generation must support 3 nodes (currently hardcoded for 2)
+- Possibly new endpoints or modifications to existing ones for adding/removing DRBD peers
+- Test `drbdadm adjust` for adding a 3rd node to a running resource
+
+**Coordinator changes:**
+- New API endpoint: `POST /api/users/{id}/migrate` with `target_machine` parameter
+- New multi-step operation type: `live_migration` in the operations table
+- Migration orchestration: create image → add 3rd DRBD node → wait sync → stop container → demote/promote → start container → cleanup
+- Crash recovery: `resumeMigration` handler in the reconciler
+
+**Test suite should cover:**
+- Provision users, trigger migration via API, verify:
+  - Data written before migration survives on destination
+  - Container running on destination machine
+  - Bipod endpoints shifted correctly (new primary, same secondary)
+  - Old machine cleaned up (no images, no DRBD config)
+  - DRBD healthy (2-node, both UpToDate)
+- Migration of primary vs migration of secondary
+- Crash during each migration phase (fault injection via FAIL_AT)
+- Consistency invariants hold after migration
+
+#### Layer 5.2 — Rebalancer & Machine Drain
+
+**Goal:** Automate migration decisions. Build on the proven migration primitive from 5.1.
+
+**Rebalancer goroutine** (similar pattern to reformer):
+- Ticks every 60 seconds
+- Computes fleet-wide averages for agent density and disk usage
+- Identifies overloaded machines (density or disk > avg + threshold)
+- Identifies underloaded machines (density or disk < avg - threshold)
+- For each overloaded machine: pick the smallest user, find a suitable destination, trigger migration
+- One migration at a time per machine (avoid thundering herd)
+- Stabilization period (don't rebalance a user that was just migrated)
+
+**Machine drain API:**
+- `POST /api/fleet/{machine_id}/drain` — marks machine as "draining", triggers sequential migration of all users off that machine
+- Draining machine stops accepting new placements (excluded from SelectMachines)
+- Once all users migrated, machine can be safely taken offline for maintenance
+- `POST /api/fleet/{machine_id}/undrain` — cancels drain, machine returns to normal
+
+**Test suite should cover:**
+- Provision users unevenly, verify rebalancer triggers migrations
+- Drain a machine, verify all users migrated off, verify machine is empty
+- Undrain mid-drain, verify remaining users stay
+- Rebalancer doesn't migrate during ongoing operations (suspend, failover, etc.)
+- Crash recovery for in-progress rebalancer-triggered migrations
+
+#### What Has Changed Since the Original v3 Design
+
+| Original v3 Design | Our Implementation | Impact on Layer 5 |
+|---|---|---|
+| Host-mount pattern (fsfreeze, unmount/remount on host) | Device-mount pattern (container gets raw `/dev/drbdN`) | No fsfreeze step. Container stop/start instead of pause/unpause. Simpler but longer downtime (~5-15s vs ~2-6s) |
+| `docker pause` + `fsfreeze` for sub-second downtime | `docker stop` (SIGTERM) for graceful shutdown | Processes get clean shutdown signal. In-memory state is lost but disk state is perfectly consistent |
+| Assumes controlled workloads | Arbitrary user workloads (HTTP servers, databases, open source projects) | Cannot rely on application-level quiesce. Must use SIGTERM — it's the universal "shut down now" contract |
+| DRBD flush-confirm step | Not needed with docker stop | `docker stop` ensures processes flush to disk before exiting. Btrfs COW handles consistency. No explicit DRBD flush needed |
+| Container unpause on destination | Fresh container start on destination | Processes restart from persisted state. Equivalent to a fast reboot on a different machine |
+
+---
+
 ### PoC Progression
 
 ```
@@ -2607,5 +2746,6 @@ Layer 4.3: Heartbeat Failure Detection           ✅ 62/62 checks
 Layer 4.4: Bipod Reformation                     ✅ 91/91 checks
 Layer 4.5: Suspension / Reactivation / Deletion  ✅ 63/63 checks
 Layer 4.6: Crash Recovery / Reconciliation       ✅ 67/67 checks
-Layer 5:   Live Migration                        ⬜ Next
+Layer 5.1: Tripod Primitive & Manual Migration   ⬜ Next
+Layer 5.2: Rebalancer & Machine Drain            ⬜
 ```
