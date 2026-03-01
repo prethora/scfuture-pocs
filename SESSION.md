@@ -1383,7 +1383,7 @@ No issues were encountered, so no drift analysis is needed. All established patt
 
 2. **Layer 4.4 (bipod reformation)** — The coordinator tracks bipod state. Layer 4.4 needs to: detect single-copy state after failover, select a new secondary machine, test `drbdadm disconnect`/`adjust` for live peer replacement.
 
-3. **Layer 4.6 (crash recovery)** — The in-memory store persists to `state.json` but has no crash recovery logic. Layer 4.6 will migrate to Postgres and add startup reconciliation (compare coordinator state with machine agent reality).
+3. **Layer 4.6 (crash recovery)** — The in-memory store persists to `state.json` but has no crash recovery logic. Layer 4.6 will migrate to Supabase (hosted Postgres) and add startup reconciliation (compare coordinator state with machine agent reality). Database connection string will be provided via environment variable.
 
 ### Layer 4.3: Heartbeat Failure Detection & Automatic Failover
 
@@ -1524,7 +1524,8 @@ The original test checked all 3 users for a 'stale' bipod on fleet-1, but placem
 | DinD storage driver | vfs (Docker Desktop), overlay2 (real Linux) | overlay2 doesn't work in nested Docker on Docker Desktop |
 | Coordinator HA | Start single, design for active-passive | All state in Postgres; advisory lock for leader election |
 | Pricing model | Usage-based metering | Fits bursty individual usage; agent negotiates resources |
-| Coordinator state | In-memory + JSON persist | No external deps for happy path; Postgres when crash recovery matters (Layer 4.6) |
+| Coordinator state | In-memory + JSON persist | No external deps for happy path; Supabase (Postgres) when crash recovery matters (Layer 4.6) |
+| Coordinator database | Supabase (hosted Postgres) | Managed Postgres avoids self-hosting burden; connection string via env var for tests |
 | Coordinator placement | Least-loaded, mutex-protected | Prevents double-placement from concurrent provisioning |
 | Fleet communication | Private IP HTTP | Coordinator uses 10.0.0.x addresses; test harness uses public IPs |
 | Health check interval | 10s tick, 30s suspect, 60s dead | 3 missed heartbeats → suspect, 6 → dead; balances detection speed vs false positives |
@@ -1621,6 +1622,8 @@ The original test checked all 3 users for a 'stale' bipod on fleet-1, but placem
      Full user lifecycle management
 
 🔲 Layer 4.6: Reconciliation + crash hardening
+     Migrate coordinator state from in-memory/JSON to Supabase (Postgres)
+     Connection string provided via environment variable for tests
      Startup reconciliation, deterministic fault injection (18 checkpoints)
      Chaos mode testing, crash recovery from any partial state
 
