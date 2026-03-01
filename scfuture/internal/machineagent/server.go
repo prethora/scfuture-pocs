@@ -24,6 +24,11 @@ func (a *Agent) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /images/{user_id}/drbd/reconfigure", a.handleDRBDReconfigure)
 	mux.HandleFunc("DELETE /images/{user_id}/drbd", a.handleDRBDDestroy)
 	mux.HandleFunc("POST /images/{user_id}/format-btrfs", a.handleFormatBtrfs)
+	mux.HandleFunc("POST /images/{user_id}/snapshot", a.handleSnapshot)
+	mux.HandleFunc("POST /images/{user_id}/backup", a.handleBackup)
+	mux.HandleFunc("POST /images/{user_id}/restore", a.handleRestore)
+	mux.HandleFunc("GET /images/{user_id}/backup/status", a.handleBackupStatus)
+	mux.HandleFunc("POST /images/{user_id}/drbd/connect", a.handleDRBDConnect)
 	mux.HandleFunc("POST /containers/{user_id}/start", a.handleContainerStart)
 	mux.HandleFunc("POST /containers/{user_id}/stop", a.handleContainerStop)
 	mux.HandleFunc("GET /containers/{user_id}/status", a.handleContainerStatus)
@@ -218,7 +223,11 @@ func (a *Agent) handleFormatBtrfs(w http.ResponseWriter, r *http.Request) {
 	lock.Lock()
 	defer lock.Unlock()
 
-	resp, err := a.FormatBtrfs(userID)
+	// Decode optional request body for bare mode
+	var req shared.FormatBtrfsRequest
+	json.NewDecoder(r.Body).Decode(&req) // Ignore error — body may be empty (backward compat)
+
+	resp, err := a.FormatBtrfs(userID, req.Bare)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "")
 		return
@@ -270,6 +279,91 @@ func (a *Agent) handleCleanup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *Agent) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+	lock := a.getUserLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var req shared.SnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	resp, err := a.Snapshot(userID, &req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *Agent) handleBackup(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+	lock := a.getUserLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var req shared.BackupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	resp, err := a.Backup(userID, &req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *Agent) handleRestore(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+	lock := a.getUserLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var req shared.RestoreRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	resp, err := a.Restore(userID, &req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *Agent) handleBackupStatus(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+
+	resp, err := a.BackupStatus(userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *Agent) handleDRBDConnect(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+	lock := a.getUserLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	resp, err := a.DRBDConnect(userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // EnsureContainerImage checks if platform/app-container exists and builds it if not.

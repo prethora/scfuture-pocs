@@ -9,12 +9,14 @@ import (
 )
 
 type Coordinator struct {
-	store *Store
+	store        *Store
+	B2BucketName string
 }
 
-func NewCoordinator(dataDir string) *Coordinator {
+func NewCoordinator(dataDir string, b2BucketName string) *Coordinator {
 	return &Coordinator{
-		store: NewStore(dataDir),
+		store:        NewStore(dataDir),
+		B2BucketName: b2BucketName,
 	}
 }
 
@@ -36,6 +38,12 @@ func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
 
 	// Reformation events
 	mux.HandleFunc("GET /api/reformations", coord.handleGetReformations)
+
+	// Lifecycle management (Layer 4.5)
+	mux.HandleFunc("POST /api/users/{id}/suspend", coord.handleSuspendUser)
+	mux.HandleFunc("POST /api/users/{id}/reactivate", coord.handleReactivateUser)
+	mux.HandleFunc("POST /api/users/{id}/evict", coord.handleEvictUser)
+	mux.HandleFunc("GET /api/lifecycle-events", coord.handleGetLifecycleEvents)
 }
 
 func (coord *Coordinator) GetStore() *Store {
@@ -142,12 +150,16 @@ func (coord *Coordinator) handleListUsers(w http.ResponseWriter, r *http.Request
 			entries = []shared.BipodEntry{}
 		}
 		result = append(result, shared.UserDetailResponse{
-			UserID:         u.UserID,
-			Status:         u.Status,
-			PrimaryMachine: u.PrimaryMachine,
-			DRBDPort:       u.DRBDPort,
-			Error:          u.Error,
-			Bipod:          entries,
+			UserID:           u.UserID,
+			Status:           u.Status,
+			PrimaryMachine:   u.PrimaryMachine,
+			DRBDPort:         u.DRBDPort,
+			Error:            u.Error,
+			Bipod:            entries,
+			BackupExists:     u.BackupExists,
+			BackupPath:       u.BackupPath,
+			BackupBucket:     u.BackupBucket,
+			DRBDDisconnected: u.DRBDDisconnected,
 		})
 	}
 	if result == nil {
@@ -179,12 +191,16 @@ func (coord *Coordinator) handleGetUser(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, shared.UserDetailResponse{
-		UserID:         u.UserID,
-		Status:         u.Status,
-		PrimaryMachine: u.PrimaryMachine,
-		DRBDPort:       u.DRBDPort,
-		Error:          u.Error,
-		Bipod:          entries,
+		UserID:           u.UserID,
+		Status:           u.Status,
+		PrimaryMachine:   u.PrimaryMachine,
+		DRBDPort:         u.DRBDPort,
+		Error:            u.Error,
+		Bipod:            entries,
+		BackupExists:     u.BackupExists,
+		BackupPath:       u.BackupPath,
+		BackupBucket:     u.BackupBucket,
+		DRBDDisconnected: u.DRBDDisconnected,
 	})
 }
 
@@ -226,6 +242,32 @@ func (coord *Coordinator) handleGetBipod(w http.ResponseWriter, r *http.Request)
 		entries = []shared.BipodEntry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+func (coord *Coordinator) handleSuspendUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+	go coord.suspendUser(userID)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "suspending", "user_id": userID})
+}
+
+func (coord *Coordinator) handleReactivateUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+	go coord.reactivateUser(userID)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "reactivating", "user_id": userID})
+}
+
+func (coord *Coordinator) handleEvictUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+	go coord.evictUser(userID)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "evicting", "user_id": userID})
+}
+
+func (coord *Coordinator) handleGetLifecycleEvents(w http.ResponseWriter, r *http.Request) {
+	events := coord.store.GetLifecycleEvents()
+	if events == nil {
+		events = []LifecycleEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

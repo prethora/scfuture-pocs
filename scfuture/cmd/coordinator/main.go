@@ -23,7 +23,9 @@ func main() {
 		dataDir = "/data"
 	}
 
-	coord := coordinator.NewCoordinator(dataDir)
+	b2Bucket := os.Getenv("B2_BUCKET_NAME")
+
+	coord := coordinator.NewCoordinator(dataDir, b2Bucket)
 
 	// Start health checker
 	coordinator.StartHealthChecker(coord.GetStore(), coordinator.NewMachineClient(""), coord)
@@ -31,12 +33,16 @@ func main() {
 	// Start reformer
 	coordinator.StartReformer(coord.GetStore(), coord)
 
+	// Start retention enforcer
+	coordinator.StartRetentionEnforcer(coord.GetStore(), coord)
+
 	mux := http.NewServeMux()
 	coord.RegisterRoutes(mux)
 
 	slog.Info("Coordinator ready",
 		"listen_addr", listenAddr,
 		"data_dir", dataDir,
+		"b2_bucket", b2Bucket,
 	)
 
 	if err := http.ListenAndServe(listenAddr, mux); err != nil {

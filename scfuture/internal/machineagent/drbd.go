@@ -232,6 +232,34 @@ func (a *Agent) DRBDDisconnect(userID string) (*shared.DRBDDisconnectResponse, e
 	return &shared.DRBDDisconnectResponse{Status: "disconnected", WasConnected: true}, nil
 }
 
+func (a *Agent) DRBDConnect(userID string) (*shared.DRBDConnectResponse, error) {
+	if err := validateUserID(userID); err != nil {
+		return nil, err
+	}
+
+	resName := "user-" + userID
+
+	// Check current status
+	info := a.getDRBDStatus(resName)
+	if info == nil {
+		return nil, fmt.Errorf("DRBD resource %s does not exist", resName)
+	}
+
+	// If already connected, return success
+	if info.ConnectionState == "Connected" {
+		slog.Info("DRBD already connected", "component", "drbd", "user", userID)
+		return &shared.DRBDConnectResponse{Status: "connected", WasConnected: true}, nil
+	}
+
+	result, err := runCmd("drbdadm", "connect", resName)
+	if err != nil {
+		return nil, cmdError("drbdadm connect failed", cmdString("drbdadm", "connect", resName), result)
+	}
+
+	slog.Info("DRBD connected to peer", "component", "drbd", "user", userID)
+	return &shared.DRBDConnectResponse{Status: "connected", WasConnected: false}, nil
+}
+
 func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureRequest) (*shared.DRBDReconfigureResponse, error) {
 	if err := validateUserID(userID); err != nil {
 		return nil, err

@@ -10,7 +10,7 @@ import (
 	"scfuture/internal/shared"
 )
 
-func (a *Agent) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error) {
+func (a *Agent) FormatBtrfs(userID string, bare bool) (*shared.FormatBtrfsResponse, error) {
 	if err := validateUserID(userID); err != nil {
 		return nil, err
 	}
@@ -34,14 +34,22 @@ func (a *Agent) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error) 
 	// Try to mount — if it succeeds the device has a filesystem
 	result, err := runCmd("mount", "-t", "btrfs", drbdDev, mountPath)
 	if err == nil {
-		// Check for workspace subvolume
-		if _, statErr := os.Stat(mountPath + "/workspace"); statErr == nil {
-			// Already formatted — unmount and return
-			runCmd("umount", mountPath)
-			slog.Info("Btrfs already formatted", "component", "btrfs", "user", userID)
-			return &shared.FormatBtrfsResponse{AlreadyFormatted: true}, nil
+		if bare {
+			// For bare mode, check if snapshots dir exists
+			if _, statErr := os.Stat(mountPath + "/snapshots"); statErr == nil {
+				runCmd("umount", mountPath)
+				slog.Info("Btrfs already formatted (bare)", "component", "btrfs", "user", userID)
+				return &shared.FormatBtrfsResponse{AlreadyFormatted: true}, nil
+			}
+		} else {
+			// Check for workspace subvolume
+			if _, statErr := os.Stat(mountPath + "/workspace"); statErr == nil {
+				runCmd("umount", mountPath)
+				slog.Info("Btrfs already formatted", "component", "btrfs", "user", userID)
+				return &shared.FormatBtrfsResponse{AlreadyFormatted: true}, nil
+			}
 		}
-		// Mounted but no workspace subvol — unmount and reformat
+		// Mounted but missing expected structure — unmount and reformat
 		runCmd("umount", mountPath)
 	}
 
@@ -57,32 +65,38 @@ func (a *Agent) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error) 
 		return nil, cmdError("mount failed", cmdString("mount", "-t", "btrfs", drbdDev, mountPath), result)
 	}
 
-	// Create workspace subvolume
-	result, err = runCmd("btrfs", "subvolume", "create", mountPath+"/workspace")
-	if err != nil {
-		runCmd("umount", mountPath)
-		return nil, cmdError("btrfs subvolume create failed", "btrfs subvolume create workspace", result)
-	}
+	if bare {
+		// Bare mode: just create snapshots directory, no workspace or seed data
+		os.MkdirAll(mountPath+"/snapshots", 0755)
+		slog.Info("Btrfs formatted (bare — no workspace)", "component", "btrfs", "user", userID)
+	} else {
+		// Full mode: create workspace subvolume with seed data
+		result, err = runCmd("btrfs", "subvolume", "create", mountPath+"/workspace")
+		if err != nil {
+			runCmd("umount", mountPath)
+			return nil, cmdError("btrfs subvolume create failed", "btrfs subvolume create workspace", result)
+		}
 
-	// Create seed directories
-	for _, dir := range []string{"memory", "apps", "data"} {
-		os.MkdirAll(mountPath+"/workspace/"+dir, 0755)
-	}
+		// Create seed directories
+		for _, dir := range []string{"memory", "apps", "data"} {
+			os.MkdirAll(mountPath+"/workspace/"+dir, 0755)
+		}
 
-	// Write config.json
-	configData := map[string]string{
-		"created": time.Now().UTC().Format(time.RFC3339),
-		"user":    userID,
-	}
-	configJSON, _ := json.Marshal(configData)
-	os.WriteFile(mountPath+"/workspace/data/config.json", configJSON, 0644)
+		// Write config.json
+		configData := map[string]string{
+			"created": time.Now().UTC().Format(time.RFC3339),
+			"user":    userID,
+		}
+		configJSON, _ := json.Marshal(configData)
+		os.WriteFile(mountPath+"/workspace/data/config.json", configJSON, 0644)
 
-	// Create snapshots directory and layer-000 snapshot
-	os.MkdirAll(mountPath+"/snapshots", 0755)
-	result, err = runCmd("btrfs", "subvolume", "snapshot", "-r",
-		mountPath+"/workspace", mountPath+"/snapshots/layer-000")
-	if err != nil {
-		slog.Warn("Snapshot creation failed (non-fatal)", "component", "btrfs", "user", userID, "error", err)
+		// Create snapshots directory and layer-000 snapshot
+		os.MkdirAll(mountPath+"/snapshots", 0755)
+		result, err = runCmd("btrfs", "subvolume", "snapshot", "-r",
+			mountPath+"/workspace", mountPath+"/snapshots/layer-000")
+		if err != nil {
+			slog.Warn("Snapshot creation failed (non-fatal)", "component", "btrfs", "user", userID, "error", err)
+		}
 	}
 
 	// Unmount — host does NOT keep Btrfs mounted
@@ -93,4 +107,54 @@ func (a *Agent) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error) 
 
 	slog.Info("Btrfs formatted and provisioned", "component", "btrfs", "user", userID)
 	return &shared.FormatBtrfsResponse{}, nil
+}
+
+// Snapshot temporarily mounts the DRBD device and creates a read-only Btrfs snapshot.
+// The DRBD resource must be Primary. After the snapshot is created, the filesystem is unmounted.
+func (a *Agent) Snapshot(userID string, req *shared.SnapshotRequest) (*shared.SnapshotResponse, error) {
+	if err := validateUserID(userID); err != nil {
+		return nil, err
+	}
+	if req.SnapshotName == "" {
+		return nil, fmt.Errorf("snapshot_name is required")
+	}
+
+	u := a.getUser(userID)
+	if u == nil {
+		return nil, fmt.Errorf("user %q not found in state", userID)
+	}
+	if u.DRBDDevice == "" {
+		return nil, fmt.Errorf("no DRBD device for user %q", userID)
+	}
+
+	mountPath := a.mountPath(userID)
+	drbdDev := u.DRBDDevice
+
+	// Mount
+	os.MkdirAll(mountPath, 0755)
+	result, err := runCmd("mount", "-t", "btrfs", drbdDev, mountPath)
+	if err != nil {
+		return nil, cmdError("mount failed for snapshot", cmdString("mount", "-t", "btrfs", drbdDev, mountPath), result)
+	}
+
+	// Create snapshots directory if needed
+	os.MkdirAll(mountPath+"/snapshots", 0755)
+
+	// Create read-only snapshot
+	snapPath := mountPath + "/snapshots/" + req.SnapshotName
+	result, err = runCmd("btrfs", "subvolume", "snapshot", "-r",
+		mountPath+"/workspace", snapPath)
+	if err != nil {
+		runCmd("umount", mountPath)
+		return nil, cmdError("btrfs snapshot failed", "btrfs subvolume snapshot -r workspace "+req.SnapshotName, result)
+	}
+
+	// Unmount
+	result, err = runCmd("umount", mountPath)
+	if err != nil {
+		return nil, cmdError("umount after snapshot failed", cmdString("umount", mountPath), result)
+	}
+
+	slog.Info("Snapshot created", "component", "btrfs", "user", userID, "snapshot", req.SnapshotName)
+	return &shared.SnapshotResponse{SnapshotName: req.SnapshotName}, nil
 }

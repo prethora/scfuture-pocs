@@ -24,6 +24,15 @@ type ReformationEvent struct {
 	Timestamp    time.Time `json:"timestamp"`
 }
 
+type LifecycleEvent struct {
+	UserID     string    `json:"user_id"`
+	Type       string    `json:"type"` // "suspension", "reactivation_warm", "reactivation_cold", "eviction", "auto_eviction", "drbd_disconnect", "backup_during_eviction"
+	Success    bool      `json:"success"`
+	Error      string    `json:"error,omitempty"`
+	DurationMS int64     `json:"duration_ms"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
 type Store struct {
 	mu       sync.RWMutex
 	machines map[string]*Machine
@@ -35,6 +44,7 @@ type Store struct {
 
 	failoverEvents    []FailoverEvent
 	reformationEvents []ReformationEvent
+	lifecycleEvents   []LifecycleEvent
 
 	dataDir string
 }
@@ -67,14 +77,19 @@ type FailoverEvent struct {
 }
 
 type User struct {
-	UserID          string    `json:"user_id"`
-	Status          string    `json:"status"`
-	StatusChangedAt time.Time `json:"status_changed_at"`
-	PrimaryMachine  string    `json:"primary_machine"`
-	DRBDPort        int       `json:"drbd_port"`
-	ImageSizeMB     int       `json:"image_size_mb"`
-	Error           string    `json:"error"`
-	CreatedAt       time.Time `json:"created_at"`
+	UserID           string    `json:"user_id"`
+	Status           string    `json:"status"`
+	StatusChangedAt  time.Time `json:"status_changed_at"`
+	PrimaryMachine   string    `json:"primary_machine"`
+	DRBDPort         int       `json:"drbd_port"`
+	ImageSizeMB      int       `json:"image_size_mb"`
+	Error            string    `json:"error"`
+	CreatedAt        time.Time `json:"created_at"`
+	BackupExists     bool      `json:"backup_exists"`
+	BackupPath       string    `json:"backup_path,omitempty"`
+	BackupBucket     string    `json:"backup_bucket,omitempty"`
+	BackupTimestamp  time.Time `json:"backup_timestamp,omitempty"`
+	DRBDDisconnected bool      `json:"drbd_disconnected"`
 }
 
 type Bipod struct {
@@ -347,6 +362,7 @@ type persistState struct {
 	NextMinor         map[string]int       `json:"next_minor"`
 	FailoverEvents    []FailoverEvent      `json:"failover_events"`
 	ReformationEvents []ReformationEvent   `json:"reformation_events"`
+	LifecycleEvents   []LifecycleEvent     `json:"lifecycle_events"`
 }
 
 func (s *Store) persist() {
@@ -361,6 +377,7 @@ func (s *Store) persist() {
 		NextMinor:         s.nextMinor,
 		FailoverEvents:    s.failoverEvents,
 		ReformationEvents: s.reformationEvents,
+		LifecycleEvents:   s.lifecycleEvents,
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -595,5 +612,80 @@ func (s *Store) GetReformationEvents() []ReformationEvent {
 	defer s.mu.RUnlock()
 	result := make([]ReformationEvent, len(s.reformationEvents))
 	copy(result, s.reformationEvents)
+	return result
+}
+
+// SetUserBackup records a successful B2 backup for a user.
+func (s *Store) SetUserBackup(userID, b2Path, bucketName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return
+	}
+	u.BackupExists = true
+	u.BackupPath = b2Path
+	u.BackupBucket = bucketName
+	u.BackupTimestamp = time.Now()
+	s.persist()
+}
+
+// SetUserDRBDDisconnected marks a user's DRBD as disconnected by the retention enforcer.
+func (s *Store) SetUserDRBDDisconnected(userID string, disconnected bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.users[userID]
+	if !ok {
+		return
+	}
+	u.DRBDDisconnected = disconnected
+	s.persist()
+}
+
+// ClearUserBipods removes all bipods for a user and clears the primary machine.
+func (s *Store) ClearUserBipods(userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for key, b := range s.bipods {
+		if b.UserID == userID {
+			delete(s.bipods, key)
+		}
+	}
+	if u, ok := s.users[userID]; ok {
+		u.PrimaryMachine = ""
+	}
+	s.persist()
+}
+
+// GetSuspendedUsers returns all users with status "suspended".
+func (s *Store) GetSuspendedUsers() []*User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*User
+	for _, u := range s.users {
+		if u.Status == "suspended" {
+			clone := *u
+			result = append(result, &clone)
+		}
+	}
+	return result
+}
+
+// RecordLifecycleEvent appends a lifecycle event.
+func (s *Store) RecordLifecycleEvent(event LifecycleEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lifecycleEvents = append(s.lifecycleEvents, event)
+	s.persist()
+}
+
+// GetLifecycleEvents returns all recorded lifecycle events.
+func (s *Store) GetLifecycleEvents() []LifecycleEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]LifecycleEvent, len(s.lifecycleEvents))
+	copy(result, s.lifecycleEvents)
 	return result
 }

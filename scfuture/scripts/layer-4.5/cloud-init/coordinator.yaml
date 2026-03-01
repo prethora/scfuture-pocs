@@ -1,0 +1,25 @@
+#cloud-config
+package_update: true
+packages:
+  - curl
+  - jq
+
+write_files:
+  - path: /etc/systemd/system/coordinator.service
+    content: |
+      [Unit]
+      Description=scfuture coordinator
+      After=network.target
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/coordinator
+      Environment=LISTEN_ADDR=0.0.0.0:8080
+      Environment=DATA_DIR=/data
+      Restart=on-failure
+      RestartSec=5
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - mkdir -p /data
+  - systemctl daemon-reload

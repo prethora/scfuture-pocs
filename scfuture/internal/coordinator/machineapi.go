@@ -128,6 +128,65 @@ func (c *MachineClient) Cleanup() error {
 	return c.doJSON("POST", "/cleanup", nil, nil)
 }
 
+func (c *MachineClient) Snapshot(userID string, req *shared.SnapshotRequest) (*shared.SnapshotResponse, error) {
+	var resp shared.SnapshotResponse
+	if err := c.doJSON("POST", fmt.Sprintf("/images/%s/snapshot", userID), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) Backup(userID string, req *shared.BackupRequest) (*shared.BackupResponse, error) {
+	// Backup can be slow — use a client with longer timeout
+	longClient := &MachineClient{
+		address: c.address,
+		client:  &http.Client{Timeout: 300 * time.Second},
+	}
+	var resp shared.BackupResponse
+	if err := longClient.doJSON("POST", fmt.Sprintf("/images/%s/backup", userID), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) Restore(userID string, req *shared.RestoreRequest) (*shared.RestoreResponse, error) {
+	// Restore can be slow — use a client with longer timeout
+	longClient := &MachineClient{
+		address: c.address,
+		client:  &http.Client{Timeout: 300 * time.Second},
+	}
+	var resp shared.RestoreResponse
+	if err := longClient.doJSON("POST", fmt.Sprintf("/images/%s/restore", userID), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) BackupStatus(userID string) (*shared.BackupStatusResponse, error) {
+	var resp shared.BackupStatusResponse
+	if err := c.doJSON("GET", fmt.Sprintf("/images/%s/backup/status", userID), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) DRBDConnect(userID string) (*shared.DRBDConnectResponse, error) {
+	var resp shared.DRBDConnectResponse
+	if err := c.doJSON("POST", fmt.Sprintf("/images/%s/drbd/connect", userID), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) FormatBtrfsBare(userID string) (*shared.FormatBtrfsResponse, error) {
+	var resp shared.FormatBtrfsResponse
+	req := shared.FormatBtrfsRequest{Bare: true}
+	if err := c.doJSON("POST", fmt.Sprintf("/images/%s/format-btrfs", userID), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 func (c *MachineClient) doJSON(method, path string, reqBody interface{}, respBody interface{}) error {
 	url := "http://" + c.address + path
 

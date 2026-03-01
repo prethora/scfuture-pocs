@@ -117,12 +117,16 @@ type CreateUserResponse struct {
 }
 
 type UserDetailResponse struct {
-	UserID         string       `json:"user_id"`
-	Status         string       `json:"status"`
-	PrimaryMachine string       `json:"primary_machine"`
-	DRBDPort       int          `json:"drbd_port"`
-	Error          string       `json:"error,omitempty"`
-	Bipod          []BipodEntry `json:"bipod"`
+	UserID           string       `json:"user_id"`
+	Status           string       `json:"status"`
+	PrimaryMachine   string       `json:"primary_machine"`
+	DRBDPort         int          `json:"drbd_port"`
+	Error            string       `json:"error,omitempty"`
+	Bipod            []BipodEntry `json:"bipod"`
+	BackupExists     bool         `json:"backup_exists"`
+	BackupPath       string       `json:"backup_path,omitempty"`
+	BackupBucket     string       `json:"backup_bucket,omitempty"`
+	DRBDDisconnected bool         `json:"drbd_disconnected"`
 }
 
 type BipodEntry struct {
@@ -192,6 +196,69 @@ type FailoverEventResponse struct {
 	Error       string `json:"error,omitempty"`
 	DurationMS  int64  `json:"duration_ms"`
 	Timestamp   string `json:"timestamp"`
+}
+
+// ─── Btrfs snapshot types (from btrfs.go, Layer 4.5) ───
+
+type SnapshotRequest struct {
+	SnapshotName string `json:"snapshot_name"` // e.g., "suspend-20260301T120000Z"
+}
+
+type SnapshotResponse struct {
+	SnapshotName string `json:"snapshot_name"`
+}
+
+// ─── Btrfs format request (Layer 4.5 — bare mode) ───
+
+type FormatBtrfsRequest struct {
+	Bare bool `json:"bare"` // true = mkfs only, no workspace/seed data
+}
+
+// ─── B2 backup/restore types (from backup.go, Layer 4.5) ───
+
+type BackupRequest struct {
+	SnapshotName string `json:"snapshot_name"` // Which snapshot to send
+	BucketName   string `json:"bucket_name"`   // B2 bucket name
+	B2KeyPrefix  string `json:"b2_key_prefix"` // e.g., "users/alice" — path prefix in bucket
+}
+
+type BackupResponse struct {
+	B2Path    string `json:"b2_path"`    // Full key in bucket, e.g., "users/alice/suspend-20260301T120000Z.btrfs.zst"
+	SizeBytes int64  `json:"size_bytes"`
+}
+
+type RestoreRequest struct {
+	BucketName   string `json:"bucket_name"`   // B2 bucket name
+	B2Path       string `json:"b2_path"`       // Full key, e.g., "users/alice/suspend-20260301T120000Z.btrfs.zst"
+	SnapshotName string `json:"snapshot_name"` // Name to use for received snapshot
+}
+
+type RestoreResponse struct {
+	SnapshotName string `json:"snapshot_name"`
+}
+
+type BackupStatusResponse struct {
+	Exists    bool   `json:"exists"`
+	B2Path    string `json:"b2_path,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
+// ─── DRBD connect types (from drbd.go, Layer 4.5) ───
+
+type DRBDConnectResponse struct {
+	Status       string `json:"status"`        // "connected"
+	WasConnected bool   `json:"was_connected"` // true if already connected before call
+}
+
+// ─── Lifecycle event types (from coordinator, Layer 4.5) ───
+
+type LifecycleEventResponse struct {
+	UserID     string `json:"user_id"`
+	Type       string `json:"type"`       // "suspension", "reactivation_warm", "reactivation_cold", "eviction", "auto_eviction", "drbd_disconnect"
+	Success    bool   `json:"success"`
+	Error      string `json:"error,omitempty"`
+	DurationMS int64  `json:"duration_ms"`
+	Timestamp  string `json:"timestamp"`
 }
 
 type UserStatusDTO struct {

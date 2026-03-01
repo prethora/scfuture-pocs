@@ -58,6 +58,13 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 		return
 	}
 
+	// Handle suspended/evicted users — just mark bipod as stale, no failover needed
+	if user.Status == "suspended" || user.Status == "evicted" {
+		logger.Info("User is suspended/evicted — marking bipod stale only", "status", user.Status)
+		coord.store.SetBipodRole(userID, deadMachineID, "stale")
+		return
+	}
+
 	// Skip if user is not in a state that needs failover
 	if user.Status != "running" && user.Status != "running_degraded" {
 		logger.Info("Skipping user — not in running state", "status", user.Status)

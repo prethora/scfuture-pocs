@@ -1383,7 +1383,7 @@ No issues were encountered, so no drift analysis is needed. All established patt
 
 2. **Layer 4.4 (bipod reformation)** — The coordinator tracks bipod state. Layer 4.4 needs to: detect single-copy state after failover, select a new secondary machine, test `drbdadm disconnect`/`adjust` for live peer replacement.
 
-3. **Layer 4.6 (crash recovery)** — The in-memory store persists to `state.json` but has no crash recovery logic. Layer 4.6 will migrate to Supabase (hosted Postgres) and add startup reconciliation (compare coordinator state with machine agent reality). Database connection string will be provided via environment variable.
+3. **Layer 4.6 (crash recovery)** — The in-memory store persists to `state.json` but has no crash recovery logic. Layer 4.6 will migrate to Supabase (hosted Postgres), add an `operations` table for crash-safe multi-step tracking, implement five-phase startup reconciliation, deterministic fault injection at 25-30 checkpoints, a ground-truth consistency checker, and chaos mode testing. See the detailed Layer 4.6 Preview section for the full extracted design from the original monolithic build prompt.
 
 ### Layer 4.3: Heartbeat Failure Detection & Automatic Failover
 
@@ -1623,9 +1623,14 @@ The original test checked all 3 users for a 'stale' bipod on fleet-1, but placem
 
 🔲 Layer 4.6: Reconciliation + crash hardening
      Migrate coordinator state from in-memory/JSON to Supabase (Postgres)
-     Connection string provided via environment variable for tests
-     Startup reconciliation, deterministic fault injection (18 checkpoints)
-     Chaos mode testing, crash recovery from any partial state
+     Operations table for crash-safe multi-step operation tracking
+     Coordinator advisory lock (pg_try_advisory_lock) for singleton enforcement
+     Five-phase startup reconciliation (discover → reconcile → resume → cleanup → start)
+     25-30 deterministic fault injection checkpoints across all operations
+     Consistency checker (8 invariants, SSH ground truth vs DB)
+     Chaos mode testing (50 iterations, 5% crash probability)
+     Graceful shutdown (drain in-progress ops before exit)
+     See detailed Layer 4.6 Preview section below for full extracted intelligence
 
 🔲 Layer 5: Live migration
      Pause/promote/unpause for rebalancing
@@ -1998,34 +2003,562 @@ Architecture Section 15.1 says containers share `user-alice-net`. We use `--netw
 
 ---
 
-### Layer 4.5 Preview: Suspension, Reactivation, and Deletion
+### Layer 4.5: Suspension, Reactivation & Deletion Lifecycle
 
-#### What It Aims to Prove
+#### Goal
 
-Layers 4.1–4.4 proved the platform can keep users alive through failures: provision, replicate, fail over, reform. Layer 4.5 proves the platform can cleanly **park users, bring them back, and clean up after them** — completing the architecture's full 4-state user lifecycle (`provisioning → running → suspended → evicted`).
+Implement the full user lifecycle beyond "running": suspend users (stop containers, snapshot, backup to B2, demote DRBD), reactivate them via warm path (images still on fleet) or cold path (restore from B2 after eviction), evict them (delete all fleet resources), and enforce retention timers that automatically disconnect DRBD and evict suspended users over time. This completes the architecture's 4-state lifecycle (`provisioning → running → suspended → evicted`).
 
-#### Capabilities
+#### Architecture
 
-1. **Suspension** (architecture Section 6.3) — When a user cancels/pauses their subscription: stop containers gracefully, take a final Btrfs snapshot, DRBD stays connected (images warm on both machines for fast reactivation), user status → `suspended`. The agent is parked, not destroyed — data stays on fleet.
+Same topology: 1 coordinator + 3 fleet machines on Hetzner Cloud (l45-* prefix). Additionally uses a Backblaze B2 bucket (created/destroyed per test run) for backup storage. Fleet machines have `b2` CLI, `zstd`, and all existing DRBD/Btrfs/Docker tooling. Retention enforcer runs with accelerated timers (15s warm retention, 30s eviction) for testing.
 
-2. **Reactivation — warm path** (architecture Section 6.4, Case A) — User resubscribes while images are still on fleet: DRBD reconnected if disconnected, promote primary, start containers. Should be near-instant.
+#### New Code Written
 
-3. **Reactivation — cold path** (architecture Section 6.4, Case B) — User resubscribes after eviction (images deleted, only B2 backup remains): pick 2 machines, download snapshot chain from B2, btrfs receive, form bipod, start containers. This is the PoC 3 (Backblaze) flow, but driven by the coordinator instead of a bash script.
+**Machine agent — new file (1):**
+- `internal/machineagent/backup.go` — `Backup` (btrfs send → zstd → b2 file upload + manifest), `Restore` (b2 file download → zstd -d → btrfs receive → workspace snapshot), `BackupStatus` (checks manifest.json in B2). All functions authorize b2 account before operations.
 
-4. **Deletion/Eviction** (architecture Section 12) — Full cleanup: DRBD destroyed, image files deleted on all fleet machines, user status → `evicted`. Safety rule: never delete the last fleet copy until B2 backup is verified.
+**Machine agent — modified files (3):**
+- `internal/machineagent/btrfs.go` — Added `bare` parameter to `FormatBtrfs` (creates only snapshots dir, no workspace/seed data — used by cold restore). Added `Snapshot` method for creating read-only Btrfs snapshots.
+- `internal/machineagent/drbd.go` — Added `DRBDConnect` method (runs `drbdadm connect` for reconnecting disconnected DRBD).
+- `internal/machineagent/server.go` — Added 5 routes: snapshot, backup, restore, backup/status, drbd/connect. Modified `handleFormatBtrfs` to accept optional `FormatBtrfsRequest` body for bare mode.
 
-#### What's Architecturally Interesting
+**Coordinator — new files (2):**
+- `internal/coordinator/lifecycle.go` — `suspendUser` (stop container → snapshot → B2 backup → demote DRBD → suspended), `reactivateUser` (routes warm/cold), `warmReactivate` (reconnect DRBD if needed → promote → start container), `coldReactivate` (select machines → create images → DRBD setup → format bare → restore from B2 → start container → reform bipod), `evictUser` (verify backup → disconnect/destroy DRBD → delete images → clear bipods).
+- `internal/coordinator/retention.go` — `StartRetentionEnforcer` goroutine (60s tick), `enforceRetention` (scans suspended users), `disconnectSuspendedDRBD`. Configurable via `WARM_RETENTION_SECONDS` and `EVICTION_SECONDS` env vars.
 
-- **First layer touching Backblaze B2 from Go code** — cold restore needs the coordinator to drive B2 downloads through the machine agent. All previous B2 work was bash scripts (PoC 3).
-- **DRBD disconnect/reconnect cycle for suspension** — different from reformation's disconnect (here both sides are alive, just parked). Tests whether DRBD bitmap resync works correctly after a clean disconnect + reconnect.
-- **Tiered retention model** — suspended < 7 days (DRBD connected), 7–30 days (DRBD disconnected, images retained), > 30 days (evicted to B2 only). The coordinator needs a background process to enforce these time-based transitions.
-- **Completes the 4-state lifecycle** — after this layer, all states from architecture Section 6 have been implemented and tested.
+**Coordinator — modified files (5):**
+- `internal/coordinator/store.go` — Added `BackupExists`, `BackupPath`, `BackupBucket`, `BackupTimestamp`, `DRBDDisconnected` to User. Added `LifecycleEvent` struct. Added 6 methods: `SetUserBackup`, `SetUserDRBDDisconnected`, `ClearUserBipods`, `GetSuspendedUsers`, `RecordLifecycleEvent`, `GetLifecycleEvents`.
+- `internal/coordinator/server.go` — Added `B2BucketName` to Coordinator. Changed `NewCoordinator` signature. Added 4 lifecycle routes (suspend, reactivate, evict, lifecycle-events) with async goroutine handlers.
+- `internal/coordinator/machineapi.go` — Added 6 client methods: `Snapshot`, `Backup` (300s timeout), `Restore` (300s timeout), `BackupStatus`, `DRBDConnect`, `FormatBtrfsBare`.
+- `internal/coordinator/healthcheck.go` — Added early return for suspended/evicted users in `failoverUser`.
+- `internal/shared/types.go` — Added 11 new types for snapshot, backup, restore, lifecycle events.
+- `cmd/coordinator/main.go` — Reads `B2_BUCKET_NAME` env var, starts retention enforcer.
 
-#### Already Proven (Not Re-tested)
+**Test scripts (7 files):**
+- `scripts/layer-4.5/` — run.sh (full lifecycle with B2 bucket management), common.sh, infra.sh, deploy.sh (deploys B2 credentials + retention timers), test_suite.sh (10 phases), cloud-init/coordinator.yaml, cloud-init/fleet.yaml (includes python3-pip, zstd, b2 CLI).
 
-- Block device stack, DRBD replication, failover, reformation — Layers 4.1–4.4
-- B2 backup/restore mechanics — PoC 3/Patch 3.1 (but needs to be wired into Go coordinator)
-- Container start/stop — every layer
+#### Lifecycle State Machine
+
+```
+running ──(suspend)──▶ suspended ──(warm retention expires)──▶ suspended+drbd_disconnected
+                                  ──(eviction timer expires)──▶ evicted
+suspended ──(reactivate, warm)──▶ running  (images on fleet, near-instant)
+evicted ──(reactivate, cold)──▶ running    (restore from B2, ~30-60s)
+suspended/evicted ──(evict)──▶ evicted     (delete fleet resources, keep B2)
+```
+
+#### Suspension Sequence
+
+1. Stop container on primary machine
+2. Create read-only Btrfs snapshot (`suspend-<timestamp>`)
+3. Upload snapshot to B2 via `btrfs send | zstd | b2 file upload` + manifest.json
+4. Demote DRBD to Secondary
+5. Set user status → `suspended`, record lifecycle event
+
+#### Cold Reactivation Sequence
+
+1. Select 2 available machines with most free space
+2. Create images (100MB loop files) on both machines
+3. Set up DRBD between them (create metadata, attach, connect)
+4. Format Btrfs in bare mode (snapshots dir only, no workspace)
+5. Download snapshot from B2, decompress, `btrfs receive`, create workspace subvolume
+6. Start container on primary
+7. Wait for DRBD sync to complete (UpToDate)
+
+#### Test Results — 63/63 Checks Passed
+
+```
+═══ Phase 0: Prerequisites ═══                                [16/16]
+  ✓ Coordinator responding, 3 fleet machines registered
+  ✓ All machines active, DRBD loaded, container images built
+  ✓ B2 CLI available on all fleet machines
+  ✓ No lifecycle events initially
+
+═══ Phase 1: Provision Users (baseline) ═══                   [6/6]
+  ✓ alice and bob provisioned and running
+  ✓ Test data written to each user's container
+  ✓ DRBD replication healthy (UpToDate) for both users
+
+═══ Phase 2: Suspend alice ═══                                [5/5]
+  ✓ alice status → suspended
+  ✓ Container stopped, DRBD demoted to Secondary
+  ✓ B2 backup exists (verified via coordinator)
+  ✓ Suspension lifecycle event recorded
+
+═══ Phase 3: Warm Reactivation (alice) ═══                    [5/5]
+  ✓ alice status → running (near-instant)
+  ✓ Container running, DRBD promoted to Primary
+  ✓ Test data intact after warm reactivation
+
+═══ Phase 4: Suspend alice again (pre-eviction) ═══           [3/3]
+  ✓ More data written, alice suspended again
+  ✓ B2 backup updated with new data
+
+═══ Phase 5: Evict alice ═══                                  [4/4]
+  ✓ alice status → evicted
+  ✓ No bipods remain, images deleted on fleet
+  ✓ Eviction lifecycle event recorded
+
+═══ Phase 6: Cold Reactivation (alice from B2) ═══            [6/6]
+  ✓ alice status → running after cold reactivation
+  ✓ Container running with 2 healthy bipods
+  ✓ Original data AND post-reactivation data survived cold restore
+
+═══ Phase 7: Retention Enforcer — DRBD Disconnect (bob) ═══   [4/4]
+  ✓ bob suspended, DRBD auto-disconnected after 15s warm retention
+  ✓ DRBD connection state → StandAlone
+  ✓ DRBD disconnect lifecycle event recorded
+
+═══ Phase 8: Retention Enforcer — Auto Eviction (bob) ═══     [2/2]
+  ✓ bob auto-evicted after 30s eviction timer
+  ✓ No bipods remain
+
+═══ Phase 9: Coordinator State Consistency ═══                [6/6]
+  ✓ alice running, bob evicted — final state correct
+  ✓ Both users have B2 backups
+  ✓ ≥6 lifecycle events recorded, state.json persisted
+
+═══ Phase 10: Cleanup ═══                                     [6/6]
+  ✓ All fleet machines cleaned, 0 users remaining
+```
+
+#### Bug Fixed During Testing
+
+- **B2 CLI authorization**: The `b2` CLI v4 on fleet machines requires explicit `b2 account authorize` before upload/download operations. The env vars `B2_KEY_ID`/`B2_APP_KEY` are not auto-detected by the CLI. Fixed by adding `b2 account authorize` calls in `backup.go` before all B2 operations (Backup, Restore, BackupStatus).
+
+---
+
+### Layer 4.6 Preview: Crash Recovery, Reconciliation & Postgres Migration
+
+> **Origin of this material:** Before Layer 4 was broken into six sub-layers (4.1–4.6), we initially wrote a single monolithic build prompt (`master-prompt4.NOT_USED.md`) that attempted to cover all of Layer 4 in one shot — provisioning, failover, reformation, suspension, crash recovery, fault injection, and chaos testing. That prompt grew to ~2,500 lines and we realized the scope was too large for a single build pass. We'd lose sight of potential gaps, and the AI would struggle to hold the full context.
+>
+> So we broke it down: Layers 4.1 (machine agent), 4.2 (coordinator happy path), 4.3 (failover), 4.4 (reformation), 4.5 (lifecycle). Each was built, tested, and proven independently — a decision that proved excellent, as each layer uncovered its own bugs and design insights.
+>
+> But the original monolithic prompt contained extensive, already-deliberated intelligence about crash recovery, reconciliation, fault injection, and Postgres migration — material that was never used because we hadn't reached that layer yet. What follows is the full extraction of that intelligence, preserved as strong suggestions for the Layer 4.6 build prompt. Not everything will transfer directly (our implementation diverged from the original design in several ways), but the core ideas, the reconciliation algorithm, the fault injection methodology, and the consistency checker are deeply considered and form a solid foundation.
+
+#### What Layer 4.6 Aims to Prove
+
+The coordinator can be killed at any point during any multi-step operation (provisioning, failover, reformation, suspension, reactivation, eviction) and recover correctly on restart. This is the final reliability primitive — after this layer, the system is crash-safe.
+
+From the original prompt: "Crash recovery from any partial state — coordinator can be killed at any point during any operation and recover correctly on restart."
+
+#### 1. Database Migration: In-Memory → Supabase (Postgres)
+
+**Why external Postgres, not local SQLite:**
+
+The original prompt explicitly reasoned: "The coordinator must be testable for crash recovery. If the database is on the coordinator machine, killing the coordinator process risks database state. An external managed database eliminates this variable entirely. Supabase's free tier provides a production-grade Postgres instance at zero cost."
+
+**Connection:** `DATABASE_URL` environment variable (Supabase Postgres connection string). Both the coordinator and the test harness use this same connection string. The database is external to all machines — it survives coordinator restarts and machine failures.
+
+**Only external Go dependency:** `github.com/lib/pq` (Postgres driver). Everything else remains standard library.
+
+**Coordinator advisory lock for singleton enforcement:**
+
+```sql
+SELECT pg_try_advisory_lock(12345)
+```
+
+On startup, the coordinator acquires this lock. If it returns false, another coordinator is already running — the new instance logs an error and exits. The lock auto-releases when the Postgres connection drops (i.e., when the coordinator process dies). This prevents split-brain and is a prerequisite for future active-passive HA.
+
+#### 2. Database Schema (Original Design)
+
+The original prompt designed a 5-table schema. Note: our current implementation uses different patterns (user-level status tracking vs. per-bipod state, no operations table), so this schema will need adaptation to match our actual codebase. Presented here as the original design with annotations on what has changed:
+
+```sql
+-- Machines in the fleet
+CREATE TABLE machines (
+    machine_id      TEXT PRIMARY KEY,
+    address         TEXT NOT NULL,              -- private IP:port of machine agent
+    status          TEXT NOT NULL DEFAULT 'active',  -- active | suspect | dead
+                                                     -- (we added 'suspect' in Layer 4.3)
+    disk_used_mb    INTEGER DEFAULT 0,
+    ram_used_mb     INTEGER DEFAULT 0,
+    active_agents   INTEGER DEFAULT 0,
+    max_agents      INTEGER DEFAULT 10,
+    last_heartbeat  TIMESTAMPTZ,
+    status_changed_at TIMESTAMPTZ              -- added in Layer 4.4
+);
+
+-- User accounts
+CREATE TABLE users (
+    user_id         TEXT PRIMARY KEY,
+    status          TEXT NOT NULL DEFAULT 'provisioning',
+                    -- registered | provisioning | running | running_degraded |
+                    -- failing_over | reforming | suspending | suspended |
+                    -- reactivating | evicted | failed | unavailable
+                    -- (expanded significantly from original's 4 statuses)
+    primary_machine TEXT REFERENCES machines(machine_id),
+    drbd_port       INTEGER UNIQUE,
+    image_size_mb   INTEGER DEFAULT 100,
+    error           TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    status_changed_at TIMESTAMPTZ,             -- added in Layer 4.4
+    -- Layer 4.5 additions:
+    backup_exists   BOOLEAN DEFAULT FALSE,
+    backup_path     TEXT,
+    backup_bucket   TEXT,
+    backup_timestamp TIMESTAMPTZ,
+    drbd_disconnected BOOLEAN DEFAULT FALSE
+);
+
+-- Bipod members (2 rows per user when healthy)
+CREATE TABLE bipods (
+    user_id         TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    machine_id      TEXT NOT NULL REFERENCES machines(machine_id),
+    role            TEXT NOT NULL,              -- primary | secondary | stale
+    drbd_minor      INTEGER,
+    loop_device     TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (user_id, machine_id)
+);
+
+-- Multi-step operations (KEY CRASH RECOVERY MECHANISM)
+-- This table is the core of crash recovery. Every multi-step operation gets a row
+-- with current_step tracking exactly where it was when the coordinator died.
+-- On restart, reconciliation reads incomplete operations and resumes from the right step.
+CREATE TABLE operations (
+    operation_id    TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,              -- provision | failover | reform_bipod |
+                                               -- suspend | reactivate | evict
+    user_id         TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    status          TEXT NOT NULL DEFAULT 'pending',
+                    -- pending | in_progress | complete | failed | cancelled
+    current_step    TEXT,                       -- tracks progress through multi-step operation
+    metadata        JSONB DEFAULT '{}',         -- operation-specific data (target machines, etc.)
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    error           TEXT
+);
+
+-- Event log (unified — replaces separate failoverEvents, reformationEvents, lifecycleEvents)
+CREATE TABLE events (
+    event_id        SERIAL PRIMARY KEY,
+    timestamp       TIMESTAMPTZ DEFAULT NOW(),
+    event_type      TEXT NOT NULL,             -- machine_offline, user_provisioned,
+                                               -- failover_complete, bipod_reformed,
+                                               -- user_suspended, user_reactivated,
+                                               -- user_evicted, drbd_disconnected, etc.
+    machine_id      TEXT,
+    user_id         TEXT,
+    operation_id    TEXT,
+    details         JSONB
+);
+
+-- Indexes
+CREATE INDEX idx_bipods_machine ON bipods(machine_id);
+CREATE INDEX idx_operations_status ON operations(status);
+CREATE INDEX idx_operations_user ON operations(user_id);
+CREATE INDEX idx_events_type ON events(event_type);
+CREATE INDEX idx_events_timestamp ON events(timestamp);
+```
+
+**Key design insight — the `operations` table:**
+
+The original prompt's most important design contribution is the `operations` table. Currently, our multi-step operations (provisioning, failover, reformation, suspension, reactivation, eviction) are tracked only by user status transitions (`running → suspending → suspended`). If the coordinator dies mid-operation, we have no record of which step it was on. The `operations` table with its `current_step` field and `metadata` JSONB gives precise crash recovery: on restart, read the incomplete operation, determine the next step, and resume. Every step is idempotent (we already proved this), so re-executing the current step is safe.
+
+**Adaptation note:** The original schema had fine-grained per-bipod state tracking (`pending → image_created → drbd_configured → drbd_synced → promoted → formatted → mounted → containers_running → ready`). Our current implementation doesn't track bipod state this granularly — we use user-level status only. The `operations` table approach may be better suited to our architecture than per-bipod state tracking, because it captures the orchestration intent (what the coordinator was trying to do) rather than just resource state.
+
+#### 3. Five-Phase Startup Reconciliation
+
+This is the most critical piece of the original design. It runs on coordinator startup BEFORE accepting any API requests or starting background goroutines.
+
+**Phase 1: Discover Reality**
+
+Probe ALL machines in the DB, regardless of their recorded status. This is critical — a machine marked `dead` by a previous coordinator run may have rebooted and be fully healthy. Only by probing can we know the actual current state.
+
+```
+For each machine in DB (ALL statuses, including 'dead'):
+  Try: GET machine /status (timeout: 5 seconds)
+  If reachable:
+    Store full status response in memory
+    Update last_heartbeat
+    Set status to 'active' (even if it was 'dead' — it's back)
+  If unreachable:
+    Mark as 'dead' in DB
+    Record: this machine is down
+```
+
+**Phase 2: Reconcile Database with Machine Reality**
+
+```
+For each user in DB:
+  For each bipod member in DB:
+    machine_status = reality[bipod.machine_id]
+
+    If machine is dead:
+      If bipod role not 'stale':
+        Mark bipod as 'stale'
+      Continue
+
+    machine_user_info = machine_status.users[user_id]
+
+    If machine_user_info is nil (machine doesn't know about this user):
+      DB says resources exist, machine says they don't
+      → Resources were lost, need to handle this
+
+    Else (machine has resources for this user):
+      Reconcile each layer:
+        image_exists → image is present
+        drbd exists and connected → DRBD is up
+        drbd exists, primary → primary role confirmed
+        container running → fully operational
+
+      Update DB to match reality if DB is behind
+
+  Check user-level consistency:
+    If user.status == 'running' but no container is running on any machine:
+      User needs repair
+    If user.status == 'provisioning' but containers are running:
+      User is actually running — update status
+
+For each machine that is online:
+  For each user the machine reports that DB doesn't know about:
+    This is an orphan — queue cleanup (Phase 3b)
+```
+
+**Phase 3: Resume Interrupted Operations**
+
+```
+operations = SELECT * FROM operations WHERE status IN ('in_progress', 'pending')
+             ORDER BY started_at
+
+For each operation:
+  Switch on operation.type:
+
+    'provision':
+      Check if required machines are online
+      If not: try to adapt (swap offline machine for a new one)
+               or mark failed and re-queue with fresh machines
+      Read current_step from operation
+      Determine next step based on current_step and actual state
+      Resume provisioning from that step
+      (All steps are idempotent, so re-executing current step is safe)
+
+    'failover':
+      Check if the surviving machine is online
+      Read current_step
+      Resume failover from next step
+
+    'reform_bipod':
+      Check if target machine is online
+      Read current_step
+      Resume reformation from next step
+
+    'suspend':
+      Read current_step
+      Resume suspension from next step
+
+    'reactivate':
+      Read current_step
+      Resume reactivation from next step
+
+    'evict':
+      Read current_step
+      Resume eviction from next step
+
+Special case: user in 'provisioning' with NO active operation
+  → Create a new provision operation and start from beginning
+  → Handles the case where coordinator crashed between creating the user
+    and creating the operation
+```
+
+**Phase 3b: Clean Up Orphans**
+
+```
+For each orphaned user resource discovered in Phase 2:
+  DELETE /images/{user_id} on the machine (full teardown)
+  Log: "Cleaned up orphaned resources for {user_id} on {machine_id}"
+```
+
+**Phase 4: Handle Offline Machines**
+
+```
+For machines discovered offline in Phase 1:
+  Run standard failover logic for primary users on that machine
+  Queue reformations for all affected users
+```
+
+**Phase 5: Start Normal Operation**
+
+```
+Start heartbeat monitor goroutine
+Start bipod health checker goroutine
+Start reformer goroutine
+Start retention enforcer goroutine
+Start HTTP server (begin accepting API requests)
+Log: "Reconciliation complete. Processed {N} operations, {M} orphans, {K} offline machines."
+```
+
+#### 4. Fault Injection System
+
+Two modes, controlled by environment variables:
+
+**Deterministic mode** (`FAIL_AT` env var):
+
+```go
+func (c *Coordinator) checkFault(name string) {
+    if c.failAt == name {
+        log.Printf("FAULT INJECTION: crashing at checkpoint '%s'", name)
+        os.Exit(1)  // Immediate, no cleanup
+    }
+}
+```
+
+The coordinator is started with `FAIL_AT=provision-primary-image-created`. When the provisioning code reaches that checkpoint, `os.Exit(1)` — immediate death, no graceful shutdown, no cleanup. Then the test restarts the coordinator without `FAIL_AT` and verifies it recovers correctly.
+
+**Chaos mode** (`CHAOS_MODE` + `CHAOS_PROBABILITY` env vars):
+
+```go
+func (c *Coordinator) checkFault(name string) {
+    // ... deterministic check first ...
+    if c.chaosMode && rand.Float64() < c.chaosProbability {
+        log.Printf("CHAOS: random crash at checkpoint '%s'", name)
+        os.Exit(1)
+    }
+}
+```
+
+Every checkpoint has a probability of killing the coordinator. Used for stress testing.
+
+`checkFault(name)` is called at every step transition in every multi-step operation. The function is a single line at the beginning of each step — trivial to add, impossible to forget.
+
+#### 5. Eighteen Deterministic Crash Points (Original Design)
+
+The original prompt identified 18 specific points where a crash could leave the system in a partial state. Each was designed to be tested individually: crash at that point, restart, verify recovery.
+
+**Provisioning (10 checkpoints):**
+
+| ID | Checkpoint | After this completes | Before this starts |
+|----|-----------|---------------------|-------------------|
+| F1 | `provision-user-created` | DB: user + bipod entries created | Image creation on primary |
+| F2 | `provision-primary-image-created` | Image exists on primary machine | Image creation on secondary |
+| F3 | `provision-secondary-image-created` | Images exist on both machines | DRBD configuration |
+| F4 | `provision-primary-drbd-configured` | DRBD config on primary | DRBD config on secondary |
+| F5 | `provision-secondary-drbd-configured` | DRBD config on both | DRBD sync wait |
+| F6 | `provision-drbd-synced` | DRBD connected and synced | DRBD promote |
+| F7 | `provision-primary-promoted` | DRBD promoted to Primary | Btrfs format |
+| F8 | `provision-btrfs-formatted` | Btrfs formatted + workspace created | Container start |
+| F9 | `provision-btrfs-mounted` | Btrfs mounted (original design) | Container start |
+| F10 | `provision-containers-started` | Container running | DB finalization |
+
+**Failover (4 checkpoints):**
+
+| ID | Checkpoint | After | Before |
+|----|-----------|-------|--------|
+| F11 | `failover-detected` | Machine marked dead, bipod stale | DRBD promote |
+| F12 | `failover-promoted` | DRBD promoted on survivor | Container start |
+| F13 | `failover-mounted` | Btrfs mounted (original design) | Container start |
+| F14 | `failover-containers-started` | Container running | DB finalization |
+
+**Reformation (4 checkpoints):**
+
+| ID | Checkpoint | After | Before |
+|----|-----------|-------|--------|
+| F15 | `reform-machine-picked` | New machine selected in DB | Image creation |
+| F16 | `reform-image-created` | Image on new machine | DRBD config |
+| F17 | `reform-drbd-configured` | DRBD configured | Sync wait |
+| F18 | `reform-synced` | Fully synced | DB finalization |
+
+**Adaptation note:** Our implementation differs from the original in several ways that affect checkpoints:
+- We use device-mount pattern (no separate mount/unmount steps), so F9 and F13 don't apply directly
+- We have 3 additional multi-step operations from Layer 4.5: suspension (5 steps), reactivation warm (4 steps), reactivation cold (10 steps), eviction (3 steps) — each needs its own crash points
+- Reformation uses `drbdadm adjust` (zero downtime), not down/up/re-promote — different step sequence
+- The total checkpoint count will likely be 25-30+ once Layer 4.5 operations are included
+
+#### 6. Consistency Checker (Ground Truth Oracle)
+
+The original prompt designed a standalone script that SSH's into every machine and verifies 8 system invariants by comparing database state against physical reality. This is the ultimate verification — not trusting the coordinator's view, but checking the actual machines.
+
+**Invariant 1:** Every `running` user has containers on **exactly one** machine (not zero, not multiple)
+
+**Invariant 2:** Every `running` user has **exactly 2** healthy bipod entries in the database
+
+**Invariant 3:** DRBD roles on machines **match** what the database says (Primary on the recorded primary, Secondary on the recorded secondary)
+
+**Invariant 4:** Primary has Btrfs mounted, secondary does **not** (original design — in our device-mount pattern, this translates to: container running on primary with device access, no container on secondary)
+
+**Invariant 5:** No same-machine bipod pairs (both copies of a user are never on the same machine)
+
+**Invariant 6:** No orphaned resources (no images on machines without matching bipod entries in the database)
+
+**Invariant 7:** DRBD port uniqueness across all users
+
+**Invariant 8:** DRBD minor uniqueness per machine
+
+The consistency checker was designed to run after every test phase and after every crash recovery to verify the system returned to a consistent state. It queries Postgres for the "expected" state and SSH's into each machine for the "actual" state.
+
+**Adaptation note:** For our device-mount pattern, Invariant 4 changes to "container running on primary, no container on secondary." We'd also want to add invariants for Layer 4.5 state (suspended users have no running containers, evicted users have no bipods, etc.).
+
+#### 7. Chaos Mode Test Design
+
+The original prompt designed a thorough chaos test:
+
+```
+Phase 9: Chaos Mode (50 iterations, 5% crash probability)
+
+1. Start coordinator with CHAOS_MODE=true, CHAOS_PROBABILITY=0.05
+2. For 50 iterations:
+   - Create a user
+   - Wait 3 seconds
+   - Check if coordinator is alive
+   - If dead: increment crash counter, restart, wait for reconciliation
+3. After all iterations:
+   - Restart coordinator WITHOUT chaos mode
+   - Let reconciliation run (15 seconds)
+   - Verify: all users are in valid final states (running/suspended/failed — not stuck
+     in transient states like provisioning/failing_over/reforming)
+   - Run full consistency checker
+   - Verify: no orphaned resources
+```
+
+The key insight: after chaos, every user must be in a terminal state (running, suspended, evicted, failed), never stuck in a transient state (provisioning, failing_over, reforming, suspending, reactivating). The reconciliation must unstick everything.
+
+#### 8. Graceful Shutdown
+
+On SIGTERM (normal shutdown, not fault injection), the coordinator should:
+
+1. Stop accepting new API requests
+2. Wait for in-progress operations to reach a checkpoint (max 10 seconds)
+3. Close database connections
+4. Exit
+
+This is for clean upgrades/restarts. Fault injection bypasses this entirely (`os.Exit(1)` — immediate death).
+
+#### 9. What Has Changed Since the Original Design
+
+Several aspects of the original prompt no longer match our implementation. These differences must be accounted for when writing the Layer 4.6 build prompt:
+
+| Original Design | Our Actual Implementation | Impact on 4.6 |
+|----------------|--------------------------|---------------|
+| Host-mount pattern (separate `/mount` and `/unmount` endpoints) | Device-mount pattern (container gets raw block device via `--device`) | Fewer crash points (no mount step), consistency invariants change |
+| Per-bipod state tracking (`pending → image_created → drbd_configured → ... → ready`) | User-level status tracking only (`registered → provisioning → running`) | Operations table `current_step` is more important — bipod state alone can't tell you where provisioning was |
+| No operations table in current code | Multi-step operations tracked only by user status | Need to ADD the operations table — this is the core crash recovery mechanism |
+| 4 user statuses (provisioning, running, suspended, failed) | 12 user statuses (registered, provisioning, running, running_degraded, failing_over, reforming, suspending, suspended, reactivating, evicted, failed, unavailable) | More transient states to unstick during reconciliation |
+| B2 backups excluded | B2 backups integrated (Layer 4.5) | Suspension, cold reactivation, and eviction crash points need to account for B2 operations |
+| Reformation uses down/up/re-promote (brief container downtime) | Reformation uses `drbdadm adjust` (zero downtime) | Different step sequence in reformation crash points |
+| Fixed DRBD minor ranges per machine (0-99, 100-199, 200-299) | Sequential per-machine from 0 | Minor allocation query changes |
+| Heartbeat threshold 15s | Heartbeat thresholds 30s suspect, 60s dead | Different timing in tests |
+| `postgresql-client` on coordinator cloud-init | Currently nothing database-related | Need to add Postgres client/connection |
+| 3 event lists (failover, reformation, lifecycle) | Same — 3 separate in-memory lists | Unify into single `events` table |
+
+#### 10. What's Most Valuable for the Layer 4.6 Build Prompt
+
+In priority order:
+
+1. **The `operations` table with `current_step` + `metadata` JSONB** — This is the crash recovery mechanism. Every multi-step operation creates an operation row, updates `current_step` after each step, and reconciliation reads incomplete operations to resume them. Without this, crash recovery is just heuristic guessing.
+
+2. **The five-phase reconciliation algorithm** — Discover reality → reconcile DB with machines → resume interrupted operations → clean up orphans → handle offline machines → start normal operation. This is the startup sequence.
+
+3. **The 18+ fault injection checkpoints and test methodology** — Deterministic crash at each point, restart, verify recovery. This is how we prove crash safety. Needs expansion for Layer 4.5 operations.
+
+4. **The consistency checker with 8 invariants** — Ground truth oracle that doesn't trust the coordinator's view. SSH into machines, compare against DB. Run after every crash recovery.
+
+5. **The advisory lock for coordinator singleton** — Simple but important. Prevents split-brain.
+
+6. **The chaos mode test** — 50 iterations, random crashes, verify everything ends up in valid states. The ultimate stress test.
+
+7. **External Postgres (Supabase) rationale** — "Killing the coordinator process risks database state if the DB is local. External managed database eliminates this variable."
 
 ---
 
@@ -2036,7 +2569,7 @@ Layer 4.1: Machine Agent PoC                    ✅ 66/66 checks
 Layer 4.2: Coordinator Happy Path               ✅ 55/55 checks
 Layer 4.3: Heartbeat Failure Detection           ✅ 62/62 checks
 Layer 4.4: Bipod Reformation                     ✅ 91/91 checks
-Layer 4.5: Suspension / Reactivation / Deletion  ⬜ Next
-Layer 4.6: Crash Recovery / Reconciliation       ⬜
+Layer 4.5: Suspension / Reactivation / Deletion  ✅ 63/63 checks
+Layer 4.6: Crash Recovery / Reconciliation       ⬜ Next
 Layer 5:   Live Migration                        ⬜
 ```
