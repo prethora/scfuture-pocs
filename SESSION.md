@@ -1,21 +1,235 @@
-# Session Log: Btrfs World Isolation PoC
+# Session Log: Distributed Agent Platform
 
-## Goal
+## Overview
+
+This session covers the design and initial prototyping of an always-on AI agent platform — a personal computing environment in the cloud where each user gets a persistent, replicated world managed by an AI agent, accessible via Telegram/WhatsApp.
+
+---
+
+## 1. Architecture Evolution: v2 → v3
+
+### Starting Point (v2)
+
+The v2 architecture was designed for a **development environment platform** (like GitHub Codespaces) where users connect and disconnect. Key concepts:
+
+- **Triangle (3-copy replication)**: Every user's data on 3 machines via DRBD
+- **Square formation**: When a user lands on a machine outside their triangle, a 4th machine joins temporarily using NBD + dm-cache for instant access while DRBD syncs in the background
+- **Connect/disconnect lifecycle**: Users come and go; idle detection triggers disconnection after grace period
+- **User states**: active, idle, offline, evicted
+- **Deterministic switchover protocol**: 10-step flush chain (docker pause → fsfreeze → dm-cache flush → DRBD flush-confirm → promote) for transitioning from NBD+dm-cache to local DRBD during square formation
+
+### The Pivot
+
+During a prior chat (exported and provided), the conversation pivoted from a dev environment platform to an **always-on agent platform** inspired by the OpenClaw hosting ecosystem. Key insight: the always-on agent model is simpler and a better market fit.
+
+### v3 Architecture (Output: `architecture-v3.md`)
+
+Produced via a TQE Mode 3 (automated three-question expansion) that identified all changes needed. Key changes:
+
+**Core primitive: Triangle → Bipod**
+- 2 copies instead of 3 (primary + secondary)
+- Backblaze B2 as the third tier of protection
+- Simpler DRBD config (2 nodes, 1 TCP connection per resource)
+
+**Eliminated entirely:**
+- Square formation (no connect/disconnect = no need for instant landing on arbitrary machines)
+- NBD remote block access
+- dm-cache block caching
+- The full deterministic switchover protocol
+- Connect/disconnect user lifecycle
+- Idle detection and grace periods
+
+**Simplified:**
+- User states: `provisioning | running | suspended | evicted` (was 6 states, now 4)
+- Minimum fleet size: 3 machines (was 5)
+- Failure recovery: binary — secondary promotes, period
+
+**Added:**
+- Live migration protocol for rebalancing (simplified: add temp 3rd DRBD node → sync → pause → promote → cleanup; ~2-6 second agent downtime)
+- Agent health monitoring (crash detection, auto-restart, crash loop detection)
+- Subscription lifecycle management
+- Cost tracking fields in the data model
+
+**Retained intact:**
+- Block device stack (sparse file → loop → DRBD → Btrfs)
+- Btrfs snapshots (layers, tweak mode, rollback)
+- Backblaze B2 integration (bucket structure, incremental send, chain maintenance)
+- Go technology stack
+- Coordinator/machine-agent architecture
+- Heartbeat system
+- Production migration path (Docker Compose prototype → Hetzner bare metal)
+
+---
+
+## 2. The Vision: Personal AI Platform
+
+### Core Concept
+
+A complete reversal of the current SaaS landscape. Instead of users connecting to narrow company-built systems, every user gets their own world in the cloud with an agent that builds, manages, and evolves their personal software ecosystem.
+
+### What Each User Gets
+
+- **Their own Docker container stack** running on the bipod
+- **Their own PostgreSQL server** for data persistence
+- **An always-on AI agent** accessible via Telegram/WhatsApp
+- **Personal apps** built by the agent, served from their world
+- **Built-in OAuth flows** for connecting to external services securely
+- **A credential vault** where agents use API keys through a sandboxed system (never directly accessing the raw keys)
+- **A memory/RAG retrieval system** so the agent remembers everything
+- **A decision queue** on their phone — the agent surfaces choices when it needs human confirmation
+- **A process manager view** on their phone — see running agents like a system manager
+- **Snapshot-based safety** — everything is snapshottable, rollbackable
+
+### The Marketplace
+
+- **Apps as source code, not binaries.** When you install an app from the marketplace, you're copying a dev environment — the full source, built to work with the platform SDKs, using your Postgres, your auth system.
+- **Every app is a starting point.** Don't like a feature? Tell your agent to modify it. Open it in staging, iterate, deploy when satisfied.
+- **The staging/production split** makes customization safe. You're not editing what your friends are using live.
+- **App creators sell blueprints** — zero marginal cost, no hosting burden. The buyer's agent handles deployment and maintenance.
+- **Upstream updates** can be pulled like git upstream merges. The agent handles conflict resolution with user customizations.
+
+### Open Source Model
+
+The entire stack is open source. Agent loop, SDKs, primitives, container orchestration, Btrfs image format, DRBD replication, marketplace protocol — all of it. Anyone technical enough can self-host.
+
+**The business is being the version that just works.** Sign up, connect Telegram, agent is live in 30 seconds on a replicated bipod with automatic failover, continuous backups, credential vault, cost controls, marketplace with one-tap installs.
+
+This is the **WordPress.com vs WordPress.org model.** The open source project makes the hosted business credible and defensible. The exit door is always open, so almost nobody walks through it.
+
+### The Bridge Between Desktop and Cloud
+
+This is a new category of software that sits between desktop applications and cloud servers:
+- Like a desktop: one user, one process, personal, lower complexity
+- Like the cloud: always on, accessible anywhere, scalable resources
+- Unlike either: managed by an agent, elastic resource usage, replicated and backed up
+
+### OAuth as Bridge, Not Destination
+
+OAuth connections to existing services (Gmail, Google Calendar, banks) are the onramp. Over time, the agent builds local replacements — email, calendar, notes, tasks, file storage — that are better because they're customized, integrated, and the user owns the data. External services gradually become unnecessary.
+
+### Open Source Projects as Starting Points
+
+The massive ecosystem of self-hosting projects (Mailcow, Nextcloud, Immich, Miniflux, Gitea, Actual Budget, etc.) become one-tap installs. The agent handles all the setup (DNS, SSL, DKIM, config). And because everything is source code, these too become starting points the agent can customize.
+
+The missing piece that prevented self-hosting from going mainstream was operational burden. The agent eliminates that entirely.
+
+---
+
+## 3. Security Architecture
+
+### World Isolation (Proven in PoC 1)
+
+Every app is a **Btrfs subvolume** inside the user's image. Each subvolume mounts into its own Docker container with its own network namespace. From inside one container, other worlds literally don't exist — no filesystem path, no network path, no metadata leakage.
+
+### Layered Security Model
+
+1. **World isolation** — each app in its own Btrfs subvolume, own container, own network namespace
+2. **Capability-based permissions** — SDK mediates all inter-world communication; each world declares what it needs; user approves
+3. **Network whitelisting** — no outbound access by default; each domain individually approved through the decision queue; enforced by platform-level firewall outside the world
+4. **Credential vault** — API keys and OAuth tokens never inside the world; accessed through SDK which makes calls on the world's behalf
+5. **Continuous snapshots** — every 10 minutes, automatic, cheap; instant rollback of any compromised world without affecting others
+6. **SDK guardrails** — security-critical code (auth, input validation, DB access) lives in platform library, not in agent-modifiable app code
+7. **Bipod + Backblaze** — data replicated and backed up; recovery always possible
+
+### Agent-Modified Code Risk
+
+The biggest security risk: agents modifying source code of internet-facing services can introduce vulnerabilities. Mitigations:
+
+- **Marketplace apps declare capabilities** at install time (network access, inter-world communication, etc.)
+- **Network whitelisting with decision queue** — even if an attacker gets into a world, they can't phone home unless that domain was whitelisted
+- **Staging gate** — automated security checks (static analysis, dependency scanning) before promotion to production
+- **Modification-restricted zones** — security-critical infrastructure (email core, auth systems) has a locked core that agents can't modify; agents build on top via APIs and SDKs
+- **Upstream tracking** — agent merges security patches from upstream projects automatically
+
+### Attack Scenario Analysis
+
+If a hacker exploits a vulnerability in a user's modified budgeting app:
+1. They're inside the container → can see budgeting data only
+2. They try to exfiltrate → network firewall blocks (only whitelisted domains)
+3. They try to access other worlds → filesystem paths don't exist, no network path
+4. They sit trapped → next 10-minute snapshot may roll them out
+5. Even if they read data → blast radius is one world's data, not the user's whole life
+
+### Metadata Isolation (Proven in PoC 1, Patch 1)
+
+Containers don't use bind mounts. Instead, the block device is passed via `--device` and the subvolume is mounted from inside via an init script. `/proc/mounts` shows only the container's own subvolume name — no host paths, no other world names, no information leakage.
+
+### Encryption (Discussed, Not Yet Implemented)
+
+- LUKS above DRBD: `sparse file → loop → DRBD → LUKS/dm-crypt → Btrfs`
+- DRBD replicates encrypted blocks — secondary never decrypts
+- Per-user encryption keys stored in coordinator database (encrypted with master key)
+- Protects against: physical disk theft, data center mishaps
+- Does NOT protect against: platform operator access (same as every cloud provider)
+- Honest framing: encryption raises the bar from casual access to deliberate targeted access
+
+---
+
+## 4. Pricing Model
+
+### Usage-Based Metering (New Concept)
+
+Traditional VPS pricing (fixed tier) doesn't fit because:
+- Resources are shared across ~200 agents per machine
+- Individual usage is bursty and unpredictable
+- An agent can negotiate resource changes in real time
+- Users shouldn't pay for idle reserved capacity
+
+### Metering Layers
+
+1. **Base rate** (~$1-2/month): cost of existing — image on two machines (bipod), DRBD running, Backblaze backups
+2. **Compute metering**: CPU-seconds consumed, sampled per minute. Near-zero when idle, spikes during heavy tasks
+3. **Memory metering**: baseline ~200MB, metered when agent requests more for heavy tasks
+4. **Storage metering**: per GB actually used (not sparse apparent size)
+
+### The Agent as Resource Negotiator
+
+- Agent knows what resources a task needs, calculates cost, surfaces decision to user
+- User can pre-authorize: "anything under $5, just do it"
+- Running cost estimate always available: "you've spent $3.20 this month so far"
+- Spending limits built in, managed through decision queue
+
+### Two Parallel Metering Systems
+
+1. **LLM tokens** (what the agent thinks costs) — routed through credential proxy
+2. **Infrastructure** (what the agent does costs) — compute, memory, storage, network
+
+Both flow through the agent, both have user-configurable limits, both surface through the decision queue.
+
+### Psychology
+
+- Light users feel respected ($2/month, not subsidizing others)
+- Heavy users feel empowered (no ceiling, pay for what you consume)
+- No bill shock: agent shows estimates, enforces limits
+- Philosophy: "your world, you only pay for what you use, no limit to the power you might need"
+
+---
+
+## 5. Coordinator Design
+
+### Approach: Start Simple, Design for HA
+
+**Approach 1 (build now):** Single coordinator, fast restart. All state in Postgres. If it dies, restart it (5-10 seconds). Agents keep running, DRBD keeps replicating. New connections and failover decisions queue up.
+
+**Approach 2 (design for):** Active-passive pair. Both connected to same Postgres. Leader election via Postgres advisory locks. Standby takes over in seconds if active dies. No split-brain risk — Postgres is single source of truth.
+
+### Key Design Principle
+
+Machine agents must be autonomous enough to keep users alive without the coordinator. Continue running containers, continue DRBD replication, buffer events. Coordinator is the brain; machine agents are the nervous system.
+
+---
+
+## 6. Proof of Concepts
+
+---
+
+### PoC 1: Btrfs World Isolation (`poc-btrfs/`)
+
+#### Goal
 
 Build a proof of concept demonstrating the foundational primitive for a distributed agent platform: a single Btrfs image file per user, divided into isolated subvolumes ("worlds"), each mounted into its own Docker container, with cheap instant snapshots and rollback. Everything runs inside Docker Desktop on macOS via a privileged Docker-in-Docker setup.
 
-## What We Built
-
-```
-poc-btrfs/
-├── docker-compose.yml          # Single privileged "machine" service
-├── machine/
-│   ├── Dockerfile              # Ubuntu 24.04 + btrfs-progs + docker.io
-│   ├── entrypoint.sh           # Starts dockerd, waits for ready, runs demo
-│   └── demo.sh                 # Full 8-phase automated PoC
-```
-
-### Architecture
+#### Architecture
 
 ```
 macOS (Docker Desktop)
@@ -28,9 +242,20 @@ macOS (Docker Desktop)
                  └─ snapshots/
 ```
 
-## Issues Encountered & Fixes
+#### File Structure
 
-### Issue 1: overlay2 storage driver not supported in DinD
+```
+poc-btrfs/
+├── docker-compose.yml          # Single privileged "machine" service
+├── machine/
+│   ├── Dockerfile              # Ubuntu 24.04 + btrfs-progs + docker.io
+│   ├── entrypoint.sh           # Starts dockerd, waits for ready, runs demo
+│   └── demo.sh                 # Full 8-phase automated PoC
+```
+
+#### Issues Encountered & Fixes
+
+##### Issue 1: overlay2 storage driver not supported in DinD
 
 **Problem:** The entrypoint started dockerd with `--storage-driver=overlay2`. Inside the privileged container, overlay2 failed to mount:
 
@@ -41,7 +266,7 @@ failed to start daemon: error initializing graphdriver: driver not supported: ov
 
 **Fix:** Switched to `--storage-driver=vfs`. The vfs driver has no kernel requirements — it works everywhere by doing full copies instead of COW layering. Slower and uses more space for image layers, but perfectly fine for a PoC where we only pull a small Alpine image.
 
-### Issue 2: /proc/mounts isolation check false positive
+##### Issue 2: /proc/mounts isolation check false positive
 
 **Problem:** Phase 4 (Prove Isolation) included a check that grepped `/proc/mounts` inside each container for other world names. This failed because `/proc/mounts` shows the host-side mount source paths (e.g., `/mnt/users/alice/app-budget`), which naturally contain the subvolume names. The container can see the *string* in its mount metadata but cannot actually *access* those paths.
 
@@ -51,9 +276,9 @@ failed to start daemon: error initializing graphdriver: driver not supported: ov
 
 **Fix:** Replaced the `/proc/mounts` grep with actual filesystem access tests — trying to `ls` the other worlds' mount paths from inside the container. These paths don't exist inside the container's filesystem namespace, so the check correctly passes. The real isolation guarantee is filesystem access, not mount metadata strings.
 
-## Final Result
+#### Final Result
 
-All 8 phases pass. Full output concludes with:
+All 8 phases pass:
 
 ```
 ════════════════════════════════════════════
@@ -78,11 +303,28 @@ Key numbers:
 - **2GB apparent** image size vs **5.1MB actual** disk usage — sparse file + Btrfs COW means you only pay for data actually written
 - 3 subvolumes + 1 snapshot + a full disaster/rollback cycle, all within that 5.1MB
 
+#### How to Run
+
+```bash
+cd poc-btrfs
+docker compose up --build
+```
+
+To explore interactively after the demo completes:
+```bash
+docker exec -it poc-btrfs-machine-1 bash
+```
+
+To clean up:
+```bash
+docker compose down -v
+```
+
 ---
 
-## Patch 1: Device Mount Isolation (replacing bind mounts)
+### PoC 1, Patch 1: Device Mount Isolation
 
-### Motivation
+#### Motivation
 
 The original PoC used bind mounts (`-v /mnt/users/alice/app-budget:/workspace`) to give each container access to its subvolume. This worked for filesystem isolation, but leaked host-side mount paths into `/proc/mounts` inside the container:
 
@@ -92,7 +334,7 @@ The original PoC used bind mounts (`-v /mnt/users/alice/app-budget:/workspace`) 
 
 While the container couldn't access other paths, it could see the host mount structure in `/proc/mounts` — leaking information about the host. In production, no container should see any host path metadata.
 
-### Approach
+#### Approach
 
 Instead of bind mounts, pass the loop device into the container via `--device` and mount the specific Btrfs subvolume from inside using an init script. Each container gets:
 
@@ -100,13 +342,24 @@ Instead of bind mounts, pass the loop device into the container via `--device` a
 2. Minimal capabilities (dropped with `--cap-drop ALL`, then specific ones added back)
 3. An init script (`container-init.sh`) that mounts the subvolume, then drops privileges by exec'ing as a non-root user
 
-### New Files Created
+Production container launch pattern:
+```bash
+docker run --device /dev/loop0 \
+  --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETUID --cap-add SETGID \
+  --network none \
+  -e SUBVOL_NAME=app-budget -e BLOCK_DEVICE=/dev/loop0 \
+  platform/app-container
+```
+
+Container init script: mount subvolume as root → drop to `appuser` via `su` → workload runs with zero capabilities as non-root.
+
+#### New Files Created
 
 - **`machine/container-init.sh`** — Init script that runs as root to `mount -o subvol=<name>`, creates an `appuser`, then `exec su` to drop privileges
 - **`machine/app-container/Dockerfile`** — Custom Alpine image with btrfs-progs and the init script baked in
 - **`machine/Dockerfile`** updated to copy the app-container build context into the machine
 
-### Changes to demo.sh
+#### Changes to demo.sh
 
 - **Phase 3:** Dynamically discovers loop device with `losetup -j`. Builds `platform/app-container` image using inner Docker daemon. Starts containers with `--device`, `--cap-drop ALL`, `--cap-add` for needed capabilities, and environment variables (`SUBVOL_NAME`, `LOOP_DEVICE`)
 - **Phase 4:** Added `/proc/mounts` metadata isolation tests — verifies each container's `/proc/mounts` shows only its own `subvol=` entry, no other subvolume names, and no host paths like `/mnt/users/alice`
@@ -114,9 +367,9 @@ Instead of bind mounts, pass the loop device into the container via `--device` a
 - **Phase 6 rollback:** Restored container started with same device-mount pattern instead of bind mount
 - **Summary:** Added "Metadata isolation verified (no host paths in /proc/mounts)" line
 
-### Issues Encountered During This Patch
+#### Issues Encountered
 
-#### Issue 3: Containers crashing immediately — `--cap-drop ALL --cap-add SYS_ADMIN`
+##### Issue 3: Containers crashing immediately — `--cap-drop ALL --cap-add SYS_ADMIN`
 
 **Problem:** The patch prompt specified `--cap-drop ALL --cap-add SYS_ADMIN` as the capability pattern. Containers started but exited immediately with no output in `docker ps`.
 
@@ -130,19 +383,17 @@ su: can't set groups: Operation not permitted
 
 **Fix:** Added `--cap-add SETUID --cap-add SETGID` to all `docker run` commands. These capabilities are only used during the init script — once `exec su` replaces the process as `appuser`, all capabilities are gone (non-root users don't inherit capabilities by default in Linux).
 
-#### Issue 4: Legacy Docker builder deprecation warning
+##### Issue 4: Legacy Docker builder deprecation warning
 
 **Problem:** The inner Docker daemon's `docker build` printed a noisy deprecation warning:
 
 ```
 DEPRECATED: The legacy builder is deprecated and will be removed in a future release.
-            Install the buildx component to build images with BuildKit:
-            https://docs.docker.com/go/buildx/
 ```
 
 **Fix:** Added `docker-buildx` to the machine Dockerfile's apt packages. The inner Docker daemon now uses BuildKit by default, suppressing the warning.
 
-#### Detour: Attempting to eliminate SETUID/SETGID capabilities
+##### Detour: Attempting to eliminate SETUID/SETGID capabilities
 
 **Context:** We noticed that adding `SETUID`/`SETGID` went against the patch prompt's explicit statement that "only SYS_ADMIN" should be needed. We explored alternatives.
 
@@ -152,7 +403,9 @@ DEPRECATED: The legacy builder is deprecated and will be removed in a future rel
 
 **Final decision:** Reverted to the `su`-based approach with `SETUID`/`SETGID` added. These capabilities exist only during the init script's brief execution and are gone once the workload process starts as `appuser`. The security posture is correct: the running workload has zero capabilities and runs as non-root. Also reverted the `util-linux` addition to the app container since it was only needed for `setpriv`.
 
-### Updated File Structure
+**Key takeaway:** This is the production pattern. Swap loop device for DRBD device and it's identical.
+
+#### Updated File Structure
 
 ```
 poc-btrfs/
@@ -166,7 +419,7 @@ poc-btrfs/
 │       └── Dockerfile          # New: Alpine + btrfs-progs + init script
 ```
 
-### Final Result
+#### Final Result
 
 All 8 phases pass with the additional metadata isolation verification:
 
@@ -192,38 +445,17 @@ All 8 phases pass with the additional metadata isolation verification:
 
 ---
 
-## How to Run (poc-btrfs)
+### PoC 2: DRBD Bipod Replication (`poc-drbd/`)
 
-```bash
-cd poc-btrfs
-docker compose up --build
-```
-
-To explore interactively after the demo completes:
-```bash
-docker exec -it poc-btrfs-machine-1 bash
-```
-
-To clean up:
-```bash
-docker compose down -v
-```
-
----
-
----
-
-# PoC 2: DRBD Bipod Replication (`poc-drbd/`)
-
-## Goal
+#### Goal
 
 Build a PoC demonstrating DRBD replication between two machines forming a bipod. Writes on the primary replicate to the secondary in real-time. When the primary dies, the secondary promotes, mounts the same Btrfs filesystem, starts containers, and all data survives. Built from `master-prompt2.md`.
 
-## Environment
+#### Environment
 
 **Hetzner bare-metal machine** running Ubuntu 24.04 LTS (kernel 6.8.0-90-generic, x86_64). Docker containers simulate fleet machines, but the kernel is real. Both containers are privileged and share the host kernel.
 
-## File Structure
+#### File Structure
 
 ```
 poc-drbd/
@@ -237,11 +469,11 @@ poc-drbd/
 │       └── Dockerfile            # Alpine + btrfs-progs + init script
 ```
 
-## Host Prerequisites Installed
+#### Host Prerequisites Installed
 
 The user had to manually install several things on the host, and we had to work around sudo and interactive prompt issues:
 
-### 1. DRBD kernel module
+##### 1. DRBD kernel module
 
 - `linux-modules-extra-6.8.0-90-generic` — Provides the in-tree DRBD 8.4 kernel module. Installed via `sudo apt install`.
 - `drbd-dkms` from LINBIT PPA (`ppa:linbit/linbit-drbd9-stack`) — Provides DRBD **9.3.0** kernel module built via DKMS. This was necessary because `drbd-utils` 9.22 (the only version in Ubuntu 24.04 repos) is incompatible with the DRBD 8.4 kernel module.
@@ -249,7 +481,7 @@ The user had to manually install several things on the host, and we had to work 
 - DKMS initially built for the wrong kernel (6.8.0-101). Had to run `sudo dkms install drbd/9.3.0-1ppa1~noble1 -k 6.8.0-90-generic` after installing headers.
 - Final state: `modprobe drbd` loads DRBD 9.3.0 from `/lib/modules/6.8.0-90-generic/updates/dkms/drbd.ko.zst`
 
-### 2. drbd-utils
+##### 2. drbd-utils
 
 - Installed via `sudo apt install drbd-utils`. Version 9.22.0.
 - **Blocked by interactive postfix dialog**: `drbd-utils` pulls in `bsd-mailx` → `postfix`, which has an interactive debconf prompt. User had to run:
@@ -259,30 +491,30 @@ The user had to manually install several things on the host, and we had to work 
   sudo DEBIAN_FRONTEND=noninteractive apt install -y drbd-utils
   ```
 
-### 3. docker-compose-v2
+##### 3. docker-compose-v2
 
 - Not installed by default. Installed via `sudo apt install docker-compose-v2`.
 
-### 4. sudo access for Claude
+##### 4. sudo access for Claude
 
 - Claude user initially couldn't run `modprobe`, `kill`, or `add-apt-repository` due to missing NOPASSWD entries.
 - User added `/usr/sbin/modprobe`, `/usr/bin/kill` to visudo, then temporarily gave full `ALL` privileges for the DRBD 9 installation steps.
 
-## Issues Encountered & Fixes During DRBD PoC
+#### Issues Encountered & Fixes — Docker Phase (Abandoned)
 
-### Issue 5: overlay2 fails in DinD (same as poc-btrfs)
+##### Issue 5: overlay2 fails in DinD (same as poc-btrfs)
 
 **Problem:** `master-prompt2.md` specified `--storage-driver=overlay2` saying "overlay2 works on real Linux". While true for native Docker, the DinD containers have overlay2 rootfs, and overlay-on-overlay fails with `invalid argument`.
 
 **Fix:** Changed `entrypoint.sh` to use `--storage-driver=vfs`, same as poc-btrfs.
 
-### Issue 6: DRBD kernel module not found in container
+##### Issue 6: DRBD kernel module not found in container
 
 **Problem:** Phase 0 tried `modprobe drbd` but the container didn't have `kmod` installed. The module was loaded on the host but `modprobe` binary was missing.
 
 **Fix:** Added `kmod` to the Dockerfile's apt packages. Also changed Phase 0 to check `/proc/drbd` first (since the module is loaded on the host and the container is privileged), falling back to `modprobe` only if needed.
 
-### Issue 7: DRBD 8.4 vs 9.x version mismatch
+##### Issue 7: DRBD 8.4 vs 9.x version mismatch
 
 **Problem:** The host kernel had DRBD 8.4.11 (from `linux-modules-extra`), but containers had `drbd-utils` 9.22.0. When `drbdadm up alice` ran, it translated to DRBD 9 kernel commands (`drbdsetup new-resource`), but the 8.4 kernel module only understands 8.4 commands. Error:
 
@@ -293,13 +525,13 @@ Command 'drbdsetup-84 new-resource alice' terminated with exit code 20
 
 **Fix:** Installed DRBD 9.3.0 kernel module from LINBIT PPA via DKMS (see Host Prerequisites above). After `sudo rmmod drbd && sudo modprobe drbd`, the 9.3.0 module loads from the DKMS `updates/` directory.
 
-### Issue 8: `drbdadm create-md` failing silently
+##### Issue 8: `drbdadm create-md` failing silently
 
 **Problem:** The original command `yes yes | drbdadm create-md alice 2>&1 | tail -1` showed "Operation canceled" and metadata wasn't actually created. DRBD 9 needs `--force` flag and different confirmation handling.
 
 **Fix:** Changed to `yes | drbdadm create-md --force alice 2>&1` (removed `tail -1` for debugging, added `--force`). Metadata creation now shows "New drbd meta data block successfully created."
 
-### Issue 9: Stale DRBD kernel state between runs
+##### Issue 9: Stale DRBD kernel state between runs
 
 **Problem:** DRBD resources and minors are kernel-global (shared between containers). After a failed run, `/dev/drbd0` persists in the kernel. Next run fails with:
 
@@ -310,7 +542,7 @@ Minor or volume exists already (delete it first)
 
 **Fix:** Added cleanup at start of Phase 0 using `drbdsetup down alice` (not `drbdadm down` which requires a config file). Also added loop device cleanup in Phase 1.
 
-### Issue 10: DRBD shared-kernel architecture conflict
+##### Issue 10: DRBD shared-kernel architecture conflict
 
 **Problem:** Both containers share the host kernel, so DRBD resource names and minor numbers are kernel-global. When machine-1 runs `drbdadm up alice`, it creates the resource and minor 0 in the kernel. When machine-2 then runs `drbdadm up alice`, it fails because:
 1. Resource `alice` already exists in the kernel
@@ -322,7 +554,7 @@ Error: `Minor or volume exists already (delete it first)` for minor 1 on machine
 
 **Attempted fix:** Replaced `drbdadm` with raw `drbdsetup`/`drbdmeta` commands, managing the entire DRBD setup from machine-1.
 
-### Issue 11: `drbdmeta` syntax differences
+##### Issue 11: `drbdmeta` syntax differences
 
 **Problem:** Multiple syntax errors with `drbdmeta` and `drbdsetup`:
 - `drbdmeta create-md --max-peers 1` — `--max-peers` is not a flag, `max_peers` is a positional arg
@@ -338,13 +570,13 @@ drbdsetup attach 0 /dev/loop0 /dev/loop0 internal
 drbdsetup primary alice --force=yes
 ```
 
-### Issue 12: Loop device collision between containers
+##### Issue 12: Loop device collision between containers
 
 **Problem:** Both machine-1 and machine-2 got `/dev/loop0`. Phase 1 had cleanup code `losetup -j /data/images/alice.img | ... | losetup -d` that, when run on machine-2, detached machine-1's loop device because `losetup -j` queries the kernel's global loop device table.
 
 **Fix:** Removed the `losetup -j` cleanup lines from Phase 1. Changed Phase 0 to clean up stale loop devices from prior runs instead.
 
-### Issue 13: FUNDAMENTAL — DRBD replication impossible with shared kernel
+##### Issue 13: FUNDAMENTAL — DRBD replication impossible with shared kernel
 
 **Problem:** After fixing all the command syntax issues (Issues 10-12), we hit the fundamental architectural limitation: **DRBD replication between two containers on the same host cannot work** because:
 
@@ -357,28 +589,28 @@ This is not a configuration bug — it's a fundamental limitation of running DRB
 
 **Attempted workaround:** Restructured demo.sh to use DRBD as a standalone block device layer (no peer connection) on machine-1, then `dd` the backing device to machine-2 to simulate replication. This proved the failover workflow but not actual real-time replication — which is the entire point of the DRBD PoC.
 
-### Issue 14: `mkfs.btrfs` on `/dev/drbd0` — device node visibility
+##### Issue 14: `mkfs.btrfs` on `/dev/drbd0` — device node visibility
 
 **Problem:** After successfully setting up DRBD (Phase 2 showed `alice role:Primary disk:UpToDate`), `mkfs.btrfs -f /dev/drbd0` failed. The DRBD kernel module creates `/dev/drbd0` in devtmpfs, but the container may not see it if devtmpfs was mounted at container start time before DRBD was configured.
 
 **Partial fix:** Added `mknod /dev/drbd0 b 147 0 2>/dev/null || true` to ensure the device node exists. Did not get to test this fix because we decided to switch approaches at this point.
 
-## Decision: Abandon Docker Approach
+#### Decision: Abandon Docker Approach
 
-### Why Docker fails for DRBD
+##### Why Docker fails for DRBD
 
 The `poc-btrfs` PoC worked perfectly with Docker because Btrfs is a **filesystem** — it operates per-mount, and each container's mount is independent. DRBD is a **kernel module** with **global state** — resources, minors, and connections are shared across all containers on the same host. Docker containers share the host kernel by design.
 
 The master-prompt2.md specification assumed containers would behave like separate machines with independent DRBD state. This is architecturally impossible with Docker on a single host.
 
-### What we tried (Docker approach)
+##### What we tried (Docker approach)
 
 1. **`drbdadm up alice`** on both containers → fails, resource already exists (Issue 10)
 2. **Raw `drbdsetup`** managing both sides from machine-1 → no peer to replicate to (Issue 13)
 3. **`dd`-based simulation** of replication → works but doesn't prove real DRBD replication
 4. Multiple `drbdmeta`/`drbdsetup` syntax fixes along the way (Issues 11, 12)
 
-### QEMU/KVM attempt
+##### QEMU/KVM attempt
 
 Tried to use QEMU/KVM VMs on the current host (each VM would have its own kernel, solving the shared-kernel problem). Discovered:
 - Current host is itself a VM (AMD EPYC with `hypervisor` flag, no `svm` flag)
@@ -388,7 +620,7 @@ Tried to use QEMU/KVM VMs on the current host (each VM would have its own kernel
 
 Built an Alpine Linux base image and extracted kernel/initramfs, but abandoned this approach due to speed concerns.
 
-### Final approach: Two Hetzner Cloud servers
+#### Final Approach: Two Hetzner Cloud Servers
 
 The real solution: use **two actual separate servers**, each with its own kernel. This is also the closest to the production environment.
 
@@ -398,12 +630,12 @@ Local machine (orchestration)
   │
   ├── hcloud CLI → Hetzner Cloud API
   │
-  ├── machine-1 (CX22, Ubuntu 24.04, private IP 10.0.0.2)
+  ├── machine-1 (CX23, Ubuntu 24.04, private IP 10.0.0.2)
   │    ├── DRBD primary (/dev/drbd0)
   │    ├── Btrfs mounted at /mnt/users/alice/
   │    └── Docker containers (native, not DinD)
   │
-  ├── machine-2 (CX22, Ubuntu 24.04, private IP 10.0.0.3)
+  ├── machine-2 (CX23, Ubuntu 24.04, private IP 10.0.0.3)
   │    ├── DRBD secondary (/dev/drbd0) — real TCP replication
   │    └── (standby until failover)
   │
@@ -426,11 +658,9 @@ Scripts:
 - `scripts/container-init.sh` — Reused from Docker approach
 - `scripts/app-container/Dockerfile` — Reused from Docker approach
 
-## Hetzner Cloud Implementation
+#### Issues Encountered & Fixes — Hetzner Cloud Phase (Successful)
 
-### Issues During Implementation
-
-#### Issue 15: Hetzner server type deprecation
+##### Issue 15: Hetzner server type deprecation
 
 **Problem:** The plan specified `cx22` server type, but Hetzner deprecated the CX Gen2 and CPX Gen1 lines in EU locations as of Dec 31, 2025. `hcloud server create --type cx22` returned `server type not found`.
 
@@ -442,13 +672,13 @@ Scripts:
 
 Selected `cx23` (2 vCPU, 4GB RAM, 40GB disk, ~$0.007/hr).
 
-#### Issue 16: fsn1 location temporarily disabled
+##### Issue 16: fsn1 location temporarily disabled
 
 **Problem:** With `cx23` at `fsn1`, server creation returned `server location disabled (resource_unavailable)`. Falkenstein was at capacity or under maintenance.
 
 **Fix:** Changed location to `nbg1` (Nuremberg). Both locations are in the `eu-central` network zone, so the private network subnet worked without changes.
 
-#### Issue 17: DRBD kernel module not compiled by DKMS
+##### Issue 17: DRBD kernel module not compiled by DKMS
 
 **Problem:** Cloud-init installed `drbd-dkms` and `linux-headers-generic`, but `modprobe drbd` failed:
 ```
@@ -467,9 +697,7 @@ runcmd:
 ```
 This ensures headers match the running kernel, then rebuilds all DKMS modules.
 
-### Successful Run
-
-After fixing all three issues, the full PoC ran end-to-end with **47/47 checks passed**:
+#### Successful Run — 47/47 Checks Passed
 
 ```
 ═══ Phase 0: DRBD Module Check ═══
@@ -557,7 +785,7 @@ After fixing all three issues, the full PoC ran end-to-end with **47/47 checks p
 
 Infrastructure auto-torn down after completion. No lingering Hetzner costs.
 
-### What Was Proven
+#### What Was Proven
 
 1. **Real DRBD Protocol A replication** — actual async block-level replication over TCP between two independent servers
 2. **Btrfs subvolumes as isolated container worlds** — each Docker container mounts only its own subvolume
@@ -567,7 +795,7 @@ Infrastructure auto-torn down after completion. No lingering Hetzner costs.
 6. **Point-in-time rollback** — corrupt data, restore from snapshot, verify recovery
 7. **Full lifecycle automation** — `./run.sh` handles everything: infra creation, provisioning, demo, teardown
 
-### How to Run (poc-drbd)
+#### How to Run
 
 ```bash
 export HCLOUD_TOKEN=your-api-token
@@ -591,21 +819,38 @@ To manage infrastructure manually:
 
 ---
 
----
+### PoC 3: Backblaze B2 Backup & Restore (`poc-backblaze/`)
 
-# PoC 3: Backblaze B2 Backup & Restore (`poc-backblaze/`)
-
-## Goal
+#### Goal
 
 Build a PoC demonstrating the third and final tier of data safety: cold backup and restore via Backblaze B2. This proves the complete recovery path: `btrfs send → zstd compress → B2 upload → [fleet copies deleted] → B2 download → zstd decompress → btrfs receive → workspace from snapshot → containers run → DRBD bipod formed`. This is the "both machines die" scenario and the "reactivation after eviction" scenario from the architecture.
 
 After this PoC, every data safety scenario in the architecture has a proven recovery path.
 
-## Environment
+#### Environment
 
 Two Hetzner Cloud CX23 servers at `nbg1` (Nuremberg), Ubuntu 24.04, private network `10.0.0.0/24`. Same as PoC 2 but with additional B2 CLI tooling. Demo runs **locally on macOS** and SSHes into both machines (unlike PoC 2 where demo.sh ran on machine-1).
 
-## File Structure
+#### Architecture
+
+```
+machine-1 (CX23, Ubuntu 24.04, private IP 10.0.0.2)
+  ├── Phase 1-7: alice.img → loop → Btrfs (creates world, backups to B2)
+  ├── Phase 7: data destroyed (simulates fleet loss)
+  └── Phase 8+: blank image → loop → DRBD secondary
+
+machine-2 (CX23, Ubuntu 24.04, private IP 10.0.0.3)
+  ├── Phase 8: blank image → loop → DRBD primary → mkfs.btrfs → btrfs receive from B2
+  └── Phase 10: containers running on restored data
+
+Backblaze B2 bucket: poc-backblaze-{random}/users/alice/
+  ├── layer-000.btrfs.zst          (full send)
+  ├── layer-001.btrfs.zst          (incremental from layer-000)
+  ├── auto-backup-latest.btrfs.zst (incremental from layer-001)
+  └── manifest.json                 (chain metadata)
+```
+
+#### File Structure
 
 ```
 poc-backblaze/
@@ -619,21 +864,21 @@ poc-backblaze/
 │       └── Dockerfile           # Alpine + btrfs-progs (from PoC 1/2)
 ```
 
-## Issues Encountered & Fixes
+#### Issues Encountered & Fixes
 
-### Issue 18: `du -b` reports apparent size, not disk usage
+##### Issue 18: `du -b` reports apparent size, not disk usage
 
 **Problem:** Phase 1 checked sparse file efficiency using `du -b` to get actual disk usage, but `du -b` (`--apparent-size --block-size=1`) reports the **apparent** file size (same as `stat -c%s`), not the actual on-disk blocks. The sparse check always failed because apparent == actual.
 
 **Fix:** Changed to `du` (without `-b`) which reports actual disk blocks in KB, then multiplied by 1024 to get bytes. Now correctly shows apparent=2048MB vs actual=4MB.
 
-### Issue 19: B2 CLI v4 requires `b2://` URI for `b2 ls`
+##### Issue 19: B2 CLI v4 requires `b2://` URI for `b2 ls`
 
 **Problem:** `b2 ls --recursive '$BUCKET_NAME'` failed with `error: argument B2_URI: Invalid B2 URI`. The B2 CLI v4 changed `b2 ls` to require a `b2://` prefixed URI.
 
 **Fix:** Changed all `b2 ls` calls from `b2 ls --recursive '$BUCKET_NAME'` to `b2 ls --recursive 'b2://$BUCKET_NAME'`. Note: `b2 file upload` and `b2 file download` do NOT need this prefix — they take the bucket name as a positional argument. Only `b2 ls` and `b2 rm` use the URI format.
 
-### Issue 20: DRBD needs block devices, not regular files
+##### Issue 20: DRBD needs block devices, not regular files
 
 **Problem:** The master-prompt3.md spec said to use `disk /data/images/alice.img` directly in the DRBD resource config. This failed: `'/data/images/alice.img' is not a block device!`. DRBD requires block devices for its backing storage.
 
@@ -641,23 +886,23 @@ poc-backblaze/
 
 **Fix:** Added `losetup` calls in Phase 10 to create loop devices on both machines before writing the DRBD config. The config now uses `$DRBD_LOOP1` / `$DRBD_LOOP2` paths.
 
-### Issue 21: `drbdadm create-md` fails on image with existing Btrfs data
+##### Issue 21: `drbdadm create-md` fails on image with existing Btrfs data
 
 **Problem:** On machine-2 (which has restored Btrfs data from the cold restore), `drbdadm create-md` detected existing data and prompted for confirmation. The `yes yes |` pipe wasn't sufficient because the interactive prompt behaves differently over SSH.
 
 **Fix:** Added `--force` flag: `yes yes | drbdadm create-md --force alice`. In `poc-drbd`, both images were created fresh/empty so this never occurred.
 
-### Issue 22: DRBD internal metadata overwrites Btrfs superblock
+##### Issue 22: DRBD internal metadata overwrites Btrfs superblock
 
 **Problem:** With `meta-disk internal`, DRBD writes its metadata at the **end** of the backing device. Since the Btrfs filesystem was created using the full 2GB loop device, DRBD's `create-md --force` overwrites the last ~128KB of the Btrfs filesystem. After DRBD sync and mount, the Btrfs superblock was corrupted: `mount /dev/drbd0: wrong fs type, bad option, bad superblock on /dev/drbd0`.
 
 **Root cause:** In `poc-drbd`, DRBD is set up on a blank device BEFORE `mkfs.btrfs` runs. So DRBD reserves the end-of-disk space for metadata first, and Btrfs is created on the (slightly smaller) `/dev/drbd0` device. In this PoC, the flow is reversed: Btrfs data exists FIRST (from cold restore), and DRBD is layered on top afterward. The internal metadata writes into space that Btrfs already uses.
 
-**Fix:** Switched from `meta-disk internal` to **external metadata devices**. Each machine creates a separate 128MB image file (`/data/images/alice-drbd-meta.img`), loop-mounts it, and uses it as `meta-disk /dev/loop1` in the DRBD config. This keeps DRBD metadata completely separate from the Btrfs data, preserving the filesystem integrity.
+**Original fix (v3.0):** Switched from `meta-disk internal` to **external metadata devices**. Each machine creates a separate 128MB image file (`/data/images/alice-drbd-meta.img`), loop-mounts it, and uses it as `meta-disk /dev/loop1` in the DRBD config. This keeps DRBD metadata completely separate from the Btrfs data.
 
-**Key learning:** When retrofitting DRBD onto an existing data-bearing image (as happens in cold restore → bipod formation), you MUST use external metadata. The `internal` metadata option only works safely when DRBD is set up BEFORE the filesystem is created.
+**Proper fix (Patch 3.1):** Reorder the cold restore flow so DRBD is set up on blank devices FIRST (with `meta-disk internal`), then format, then receive. See Patch 3.1 below.
 
-## B2 Bucket Structure
+#### B2 Bucket Structure
 
 ```
 b2://poc-backblaze-{random}/users/alice/
@@ -667,106 +912,19 @@ b2://poc-backblaze-{random}/users/alice/
   └── manifest.json                     (snapshot chain metadata)
 ```
 
-## Successful Run — 64/64 Checks Passed
+#### Iterations (v3.0)
 
-```
-═══ Phase 0: Prerequisites ═══
-  [CHECK 01] PASS: DRBD module loaded (machine-1)
-  [CHECK 02] PASS: DRBD module loaded (machine-2)
-  [CHECK 03] PASS: Docker running (machine-1)
-  [CHECK 04] PASS: Docker running (machine-2)
-  [CHECK 05] PASS: btrfs + zstd + jq available (machine-1)
-  [CHECK 06] PASS: btrfs + zstd + jq available (machine-2)
-  [CHECK 07] PASS: B2 CLI available (machine-1)
-  [CHECK 08] PASS: B2 CLI available (machine-2)
-  [CHECK 09] PASS: B2 authorized (machine-1)
-  [CHECK 10] PASS: B2 bucket created
+5 attempts to get all 64 checks passing:
 
-═══ Phase 1: Create User World on Machine-1 ═══
-  [CHECK 11] PASS: Image sparse: apparent 2048MB, actual 4MB
-  [CHECK 12] PASS: Btrfs mounted at /mnt/users/alice
-  [CHECK 13] PASS: Seed data written
-  [CHECK 14] PASS: layer-000 snapshot created (read-only)
-  [CHECK 15] PASS: Workspace subvolume exists
+| Attempt | Result | Issue |
+|---------|--------|-------|
+| 1 | 3 FAIL, exit at Phase 6 | `du -b` sparse check wrong; `b2 ls` missing `b2://` prefix; `set -e` exit |
+| 2 | 55 PASS, exit at Phase 10 | Fixed sparse + b2 ls; DRBD config used raw file path instead of loop device |
+| 3 | 55 PASS, exit at Phase 10 | Fixed loop devices; `create-md` failed on data-bearing image (no --force) |
+| 4 | 57 PASS, exit at Phase 10 | Fixed --force; DRBD internal metadata overwrote Btrfs superblock |
+| 5 | **64 PASS** | Fixed: external DRBD metadata device |
 
-═══ Phase 2: Full Backup — layer-000 to B2 ═══
-  [CHECK 16] PASS: btrfs send + zstd compression succeeded
-  [CHECK 17] PASS: layer-000 uploaded to B2 (1232 bytes)
-  [CHECK 18] PASS: manifest.json uploaded
-  [CHECK 19] PASS: layer-000 verified in B2 bucket
-
-═══ Phase 3: Simulate Agent Work + Create layer-001 ═══
-  [CHECK 20] PASS: New data written to workspace
-  [CHECK 21] PASS: layer-001 snapshot created
-  [CHECK 22] PASS: layer-001 contains new data
-
-═══ Phase 4: Incremental Backup — layer-001 to B2 ═══
-  [CHECK 23] PASS: Incremental send succeeded
-  [CHECK 24] PASS: Incremental smaller than full (838 < 1232)
-  [CHECK 25] PASS: layer-001 uploaded to B2
-  [CHECK 26] PASS: manifest.json has 2 chain entries
-
-═══ Phase 5: More Agent Work + Auto-Backup ═══
-  [CHECK 27] PASS: auto-backup-latest snapshot created
-  [CHECK 28] PASS: auto-backup-latest uploaded to B2
-  [CHECK 29] PASS: manifest.json has 3 chain entries
-  [CHECK 30] PASS: Chain ordering correct: layer-000 → layer-001 → auto-backup-latest
-
-═══ Phase 6: Verify B2 Bucket Contents ═══
-  [CHECK 31] PASS: Bucket has 4 files (expected 4)
-  [CHECK 32] PASS: manifest.json is valid JSON
-  [CHECK 33] PASS: manifest.json chain has 3 entries
-  [CHECK 34] PASS: All chain entries have size_bytes > 0
-  [CHECK 35] PASS: All manifest keys match actual B2 objects
-
-═══ Phase 7: Simulate Total Loss — Destroy Machine-1 Data ═══
-  [CHECK 36] PASS: /mnt/users/alice is not mounted
-  [CHECK 37] PASS: /data/images/alice.img destroyed
-  [CHECK 38] PASS: Data irrecoverable on machine-1 — only B2 remains
-
-═══ Phase 8: Cold Restore on Machine-2 ═══
-  [CHECK 39] PASS: Fresh Btrfs created on machine-2
-  [CHECK 40] PASS: layer-000 received
-  [CHECK 41] PASS: layer-001 received (incremental)
-  [CHECK 42] PASS: auto-backup-latest received (incremental)
-  [CHECK 43] PASS: All snapshots + workspace present (4 subvolumes)
-  [CHECK 44] PASS: config.json: version=1.2
-  [CHECK 45] PASS: MEMORY.md: contains Session 1 and Session 2
-  [CHECK 46] PASS: apps/core/index.html intact
-  [CHECK 47] PASS: apps/email/inbox.html: has boss's email
-  [CHECK 48] PASS: apps/budget/ledger.json: has 2 transactions
-  [CHECK 49] PASS: apps/budget/alerts.json: has threshold alert
-  [CHECK 50] PASS: layer-000 snapshot accessible (config version=1.0)
-
-═══ Phase 9: Start Containers on Machine-2 ═══
-  [CHECK 51] PASS: Container alice-core running on machine-2
-  [CHECK 52] PASS: Container reads restored config.json (version=1.2)
-  [CHECK 53] PASS: Container reads restored MEMORY.md (has Session 2)
-
-═══ Phase 10: Form Bipod from Restored Data ═══
-  [CHECK 54] PASS: DRBD config written on both machines
-  [CHECK 55] PASS: DRBD metadata created on both
-  [CHECK 56] PASS: machine-2 promoted to primary
-  [CHECK 57] PASS: DRBD sync complete — both nodes UpToDate
-  [CHECK 58] PASS: Btrfs mounted on /dev/drbd0 (machine-2)
-
-═══ Phase 11: Verify Bipod + Data Integrity ═══
-  [CHECK 59] PASS: config.json intact on DRBD (version=1.2)
-  [CHECK 60] PASS: MEMORY.md intact on DRBD (has Session 2)
-  [CHECK 61] PASS: New snapshot created on DRBD-backed Btrfs
-  [CHECK 62] PASS: All subvolumes present (5 total: 3 snapshots + workspace + post-restore)
-  [CHECK 63] PASS: btrfs receive correctly rejected incremental without parent
-  [CHECK 64] PASS: Chain ordering in manifest.json is mandatory — confirmed
-
-════════════════════════════════════════════════
- Backblaze B2 Backup & Restore PoC — Results
-════════════════════════════════════════════════
-  Passed: 64
-  Failed: 0
-  ALL CHECKS PASSED
-```
-
-## What Was Proven
+#### What Was Proven
 
 1. **Full backup to B2** — `btrfs send → zstd compress → B2 file upload` of initial snapshot
 2. **Incremental backups** — delta sends using parent snapshot; incremental smaller than full (838 < 1232 bytes)
@@ -780,19 +938,7 @@ b2://poc-backblaze-{random}/users/alice/
 10. **Btrfs on DRBD works post-restore** — new snapshots can be created on the DRBD-backed filesystem
 11. **Chain ordering enforced** — out-of-order `btrfs receive` correctly fails without parent snapshot
 
-## Iterations Required
-
-5 attempts to get all 64 checks passing:
-
-| Attempt | Result | Issue |
-|---------|--------|-------|
-| 1 | 3 FAIL, exit at Phase 6 | `du -b` sparse check wrong; `b2 ls` missing `b2://` prefix; `set -e` exit |
-| 2 | 55 PASS, exit at Phase 10 | Fixed sparse + b2 ls; DRBD config used raw file path instead of loop device |
-| 3 | 55 PASS, exit at Phase 10 | Fixed loop devices; `create-md` failed on data-bearing image (no --force) |
-| 4 | 57 PASS, exit at Phase 10 | Fixed --force; DRBD internal metadata overwrote Btrfs superblock |
-| 5 | **64 PASS** | Fixed: external DRBD metadata device |
-
-## How to Run (poc-backblaze)
+#### How to Run
 
 ```bash
 export HCLOUD_TOKEN="your-hetzner-api-token"
@@ -805,13 +951,11 @@ cd poc-backblaze
 
 ---
 
----
+### Patch 3.1: Fix Cold Restore Ordering — DRBD Before Filesystem
 
-# Patch 3.1: Fix Cold Restore Ordering — DRBD Before Filesystem
+#### Motivation
 
-## Motivation
-
-The original PoC 3 used a suboptimal approach for cold restore → bipod formation. The flow was:
+The original PoC 3 (v3.0) used a suboptimal flow for cold restore → bipod formation:
 
 1. Phase 8: Restore Btrfs data onto a plain loop device (no DRBD)
 2. Phase 9: Start containers on the raw loop device
@@ -821,7 +965,7 @@ This created two problems:
 - **External metadata complexity** — 128MB `alice-drbd-meta.img` files, extra loop devices, `--force` on `create-md`
 - **Different code path** — cold restore used a different block device stack than normal provisioning (external metadata vs. internal)
 
-## The Fix
+#### The Fix
 
 Reorder so DRBD is set up on **blank devices FIRST** (with `meta-disk internal`, same as PoC 2), then format Btrfs on `/dev/drbd0`, then `btrfs receive` the snapshots. All `btrfs receive` writes replicate to machine-1 via DRBD in real-time.
 
@@ -832,9 +976,7 @@ sparse file → loop device → DRBD (meta-disk internal) → /dev/drbd0 → mkf
 
 No external metadata files. No `--force` on `create-md`. No special cases. One architecture for all paths.
 
-## What Changed
-
-### Phase restructuring
+#### Phase Restructuring
 
 | Phase | Before (v3.0) | After (v3.1) |
 |-------|---------------|--------------|
@@ -844,7 +986,8 @@ No external metadata files. No `--force` on `create-md`. No special cases. One a
 | 11 | Verify bipod + data | Verify bipod + data (unchanged) |
 | 12 | Negative test | Negative test (unchanged) |
 
-### New Phase 8 flow (merged cold restore + DRBD)
+#### New Phase 8 Flow (Merged Cold Restore + DRBD)
+
 1. Create blank 2G images on **both** machines
 2. Loop devices on both
 3. DRBD config with `meta-disk internal` (same as poc-drbd)
@@ -855,28 +998,20 @@ No external metadata files. No `--force` on `create-md`. No special cases. One a
 8. Create workspace, verify data integrity
 9. All writes replicate to machine-1 via DRBD Protocol A in real-time
 
-### New Phase 9 — DRBD sync verification
-- Wait for machine-1 (Secondary) to reach UpToDate
-- Verify roles: machine-2 Primary, machine-1 Secondary
+#### Removed
 
-### New Phase 10 — Containers use `/dev/drbd0`
-- Container starts with `--device /dev/drbd0` (not raw loop device)
-
-### Removed
 - `alice-drbd-meta.img` files (128MB external metadata images)
 - Extra loop devices for metadata
 - `--force` flag on `drbdadm create-md`
 - Unmount/re-mount dance between old Phases 9→10
 
-## Issues Encountered
-
-### Issue 23: DRBD status `peer-role` vs `role` format
+#### Issue 23: DRBD status `peer-role` vs `role` format
 
 **Problem:** Phase 9's DRBD role verification checked for `peer-role:Secondary` in the `drbdadm status` output. The actual output format shows the peer's role as `poc-b2-machine-1 role:Secondary` (under the peer name), not as `peer-role:Secondary`.
 
 **Fix:** Changed grep pattern from `peer-role:Secondary` to `poc-b2-machine-1 role:Secondary`.
 
-## Iterations
+#### Iterations
 
 2 attempts:
 
@@ -885,7 +1020,7 @@ No external metadata files. No `--force` on `create-md`. No special cases. One a
 | 1 | 64/65 PASS, 1 FAIL | `peer-role:Secondary` grep pattern wrong (Issue 23) |
 | 2 | **65/65 PASS** | Fixed grep pattern |
 
-## Result — 65/65 Checks Passed
+#### Result — 65/65 Checks Passed
 
 ```
 ═══ Phase 0: Prerequisites ═══                     — 10 checks (DRBD, Docker, tools, B2)
@@ -907,7 +1042,7 @@ No external metadata files. No `--force` on `create-md`. No special cases. One a
   ALL CHECKS PASSED
 ```
 
-## Key Outcome
+#### Key Outcome
 
 The cold restore path now uses the **identical block device stack** as normal provisioning:
 
@@ -921,7 +1056,7 @@ Cold restore (poc-backblaze v3.1):
 
 One architecture. No special cases. Issue 22 (external metadata workaround) is no longer needed.
 
-## Resource Teardown Verified
+#### Resource Teardown Verified
 
 After each run:
 - `poc-b2-machine-1` — deleted
@@ -933,13 +1068,29 @@ After each run:
 
 ---
 
-# Layer 4.1: Machine Agent PoC
+### Layer 4.1: Machine Agent PoC (`poc-coordinator/`)
 
-## Goal
+#### Goal
 
-Build a Go HTTP server (machine agent) that wraps the proven block device stack behind idempotent API endpoints. First Go code in the project. A bash test harness on macOS drives the agent through the full lifecycle via HTTP calls, playing the role that a coordinator will play in Layer 4.2.
+Build a Go HTTP server (machine agent) that wraps the proven block device stack behind idempotent API endpoints. First Go code in the project. Zero external dependencies — standard library only. A bash test harness on macOS drives the agent through the full lifecycle via HTTP calls, playing the role that a coordinator will play in Layer 4.2.
 
-## What We Built
+#### Architecture
+
+```
+macOS (test harness — bash scripts)
+  │
+  ├── HTTP → machine-1 (Hetzner CX23, public IP, port 8080) — Go machine agent
+  └── HTTP → machine-2 (Hetzner CX23, public IP, port 8080) — Go machine agent
+
+Each machine runs:
+  machine-agent binary on :8080
+  └── 13 HTTP endpoints wrapping: losetup, drbdadm, mkfs.btrfs, btrfs subvolume, docker
+
+Hetzner private network (10.0.0.0/24):
+  machine-1 ←──DRBD──→ machine-2 (per-user ports, 7900+)
+```
+
+#### File Structure
 
 ```
 poc-coordinator/
@@ -969,28 +1120,12 @@ poc-coordinator/
 │   ├── test_suite.sh                  # 9 phases, 66 checks
 │   └── cloud-init/
 │       └── fleet.yaml                  # DRBD 9 + Docker + btrfs-progs + systemd unit
-└── bin/
-    └── machine-agent                   # Cross-compiled Linux/amd64 binary
+├── bin/
+│   └── machine-agent                   # Cross-compiled Linux/amd64 binary
+└── BUILD_PROMPT.md                     # Build prompt for Layer 4.1
 ```
 
-## Architecture
-
-```
-macOS (test harness — bash scripts)
-  │
-  ├── HTTP → machine-1 (Hetzner CX23, public IP, port 8080)
-  └── HTTP → machine-2 (Hetzner CX23, public IP, port 8080)
-
-Each machine runs:
-  Go HTTP server (machine-agent) on :8080
-  └── Wraps: losetup, drbdadm, mkfs.btrfs, btrfs subvolume, docker run
-
-Hetzner private network (10.0.0.0/24):
-  machine-1 ←──DRBD──→ machine-2
-  Per-user DRBD resources on separate ports (7900+)
-```
-
-## API Endpoints (13 routes)
+#### API Endpoints (13 routes)
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -1008,7 +1143,7 @@ Hetzner private network (10.0.0.0/24):
 | GET | /containers/{user_id}/status | Container running/exists |
 | POST | /cleanup | Full machine cleanup |
 
-## Test Results — 66/66 Checks Passing
+#### Test Results — 66/66 Checks Passed
 
 ```
 Phase 0: Prerequisites                          [8/8]
@@ -1025,14 +1160,14 @@ ALL PHASES COMPLETE: 66/66 checks passed
 ═══════════════════════════════════════════════════
 ```
 
-## Issues Encountered & Fixes
+#### Issues Encountered & Fixes
 
-### Issue 1: SSH key path (macOS)
+##### Issue 24: SSH key path (macOS)
 
 **Problem:** `infra.sh` referenced `~/.ssh/id_ed25519.pub` which didn't exist.
 **Fix:** Changed to `~/.ssh/id_rsa.pub` which is the available key.
 
-### Issue 2: DRBD status parser — extra tokens on status lines
+##### Issue 25: DRBD status parser — extra tokens on status lines
 
 **Problem:** DRBD 9 status output includes extra key:value pairs on the same line:
 ```
@@ -1042,67 +1177,49 @@ The initial parser treated the entire line as the disk state value, producing `"
 
 **Fix:** Rewrote parser to be token-based — split each line into space-separated tokens and extract known `key:value` prefixes individually. Now correctly yields `"disk_state":"UpToDate"`.
 
-### Issue 3: DRBD sync requires Primary first
+##### Issue 26: DRBD sync requires Primary first
 
 **Problem:** Test harness waited for DRBD sync (UpToDate/UpToDate) BEFORE promoting either side. On a fresh DRBD resource, both sides start as Secondary/Inconsistent — sync never starts without a Primary.
 
 **Fix:** Moved the promote call before the sync wait loop. After `drbdadm primary --force`, initial full sync begins and the wait loop succeeds.
 
-### Issue 4: AppArmor blocks mount inside containers
+##### Issue 27: AppArmor blocks mount inside containers
 
 **Problem:** On real Hetzner Ubuntu 24.04 machines, `mount` inside the container fails with "Permission denied" even with `--cap-add SYS_ADMIN`. AppArmor's default Docker profile restricts mount syscalls. In PoC 1 (DinD), AppArmor was not active inside the privileged outer container, so this wasn't seen.
 
 **Fix:** Added `--security-opt apparmor=unconfined` to the `docker run` command. The container already drops all caps except SYS_ADMIN (for mount) and drops to unprivileged user after init, so AppArmor confinement is redundant here.
 
-### Issue 5: `declare -A` not supported on macOS bash 3.2
+**Impact:** New required flag for production container pattern.
+
+##### Issue 28: macOS bash 3.2 doesn't support `declare -A`
 
 **Problem:** macOS ships bash 3.2 which doesn't support associative arrays (`declare -A`). Phase 7's multi-user test used associative arrays to track loop devices per user.
 
-**Fix:** Replaced associative arrays with simple variables. Inline the loop device capture directly into the DRBD config construction within the same loop iteration.
+**Fix:** Replaced associative arrays with simple variables.
 
-### Issue 6: `docker exec` runs as root, not PID 1's user
+##### Issue 29: `docker exec` runs as root, not PID 1's user
 
 **Problem:** The "running as appuser" check used `docker exec alice-agent id -un` which returns `root` because `docker exec` defaults to root user, not the container's PID 1 user.
 
 **Fix:** Changed check to use `docker top` which shows the host-visible process list. On the host, the user shows as UID `1000` (appuser's UID) rather than `root`, confirming the workload runs unprivileged.
 
-### Issue 7: Cleanup must handle DRBD holding loop devices
+##### Issue 30: Cleanup must handle DRBD holding loop devices
 
 **Problem:** Cleanup failed to release loop devices because DRBD was still using them as backing devices. `losetup -d` fails when the loop device has holders (DRBD). The cleanup function in Go removed the DRBD config file before calling `drbdadm down`, which then couldn't find the resource.
 
-**Fix:** The cleanup Go code calls `drbdadm down` before removing the config file. For the full machine cleanup, it also handles the case where a Docker container holds a mount on the DRBD device (which prevents DRBD from going down).
+**Fix:** Fixed ordering: `drbdadm down` BEFORE removing config; full dependency chain: stop container → unmount → DRBD down → remove config → detach loop → delete image.
 
-## Key Learnings
+#### Key Learnings from Layer 4.1
 
-### 1. DRBD 9 Status Output Is Token-Based
+1. **Idempotent API Design Works** — Every endpoint was safe to call multiple times — the test harness proved this across images, DRBD, Btrfs format, containers, and cleanup. Critical for crash recovery in later layers.
 
-DRBD 9 status lines contain multiple space-separated `key:value` tokens per line. A line like `disk:UpToDate open:no` has two tokens. Parsers must split on spaces and match by prefix, not treat the whole line as a single value.
+2. **Device-Mount Pattern Works on Real Servers** — The production container isolation pattern (block device via `--device`, mount inside container, drop to unprivileged user) works correctly on real Hetzner servers with DRBD devices, not just loop devices in DinD.
 
-### 2. AppArmor on Real Machines vs DinD
+3. **Failover via API Is Clean** — Stop container → demote DRBD → promote other side → start container. No host mount needed. Data survives. The device-mount pattern eliminates the need for host-side Btrfs mounts during normal operation.
 
-PoC 1 ran inside a privileged DinD container where AppArmor was inactive. On real Ubuntu 24.04 servers, Docker's default AppArmor profile restricts `mount` even with `CAP_SYS_ADMIN`. For the device-mount pattern, `--security-opt apparmor=unconfined` is required.
+4. **Multi-User Density Confirmed** — 3 users on the same machine pair with separate DRBD resources, ports, minors — no resource collisions. Stopping one user's container doesn't affect others.
 
-### 3. DRBD Initial Sync Needs a Primary
-
-A fresh DRBD resource starts with both sides Secondary/Inconsistent. No sync occurs until one side is promoted to Primary with `--force`. Orchestration must promote before waiting for sync.
-
-### 4. Idempotent API Design Works
-
-Every endpoint was safe to call multiple times — the test harness proved this across images, DRBD, Btrfs format, containers, and cleanup. Critical for crash recovery in later layers.
-
-### 5. Device-Mount Pattern Works on Real Servers
-
-The production container isolation pattern (block device via `--device`, mount inside container, drop to unprivileged user) works correctly on real Hetzner servers with DRBD devices, not just loop devices in DinD.
-
-### 6. Failover via API Is Clean
-
-Stop container → demote DRBD → promote other side → start container. No host mount needed. Data survives. The device-mount pattern eliminates the need for host-side Btrfs mounts during normal operation.
-
-### 7. Multi-User Density Confirmed
-
-3 users on the same machine pair with separate DRBD resources, ports, minors — no resource collisions. Stopping one user's container doesn't affect others.
-
-## Resource Teardown Verified
+#### Resource Teardown Verified
 
 After the run:
 - `poc41-machine-1` — deleted
@@ -1110,3 +1227,500 @@ After the run:
 - `poc41-net` — deleted
 - `poc41` SSH key — deleted
 - Pre-existing servers — untouched
+
+---
+
+### Layer 4.2: Coordinator Happy Path (`poc-coordinator/`)
+
+#### Goal
+
+Build a Go coordinator HTTP service that manages a fleet of machine agents and orchestrates user provisioning. The coordinator selects machines, drives the full provisioning state machine (image creation → DRBD → promote → sync → Btrfs format → container start), and tracks all state in memory. This is the "happy path" layer: provisioning works, fleet is healthy, no failures.
+
+#### Architecture
+
+```
+macOS (test harness — bash scripts)
+  │
+  ├── HTTP → coordinator (Hetzner CX23, public IP, :8080) — Go coordinator binary
+  │            └── Private IP: 10.0.0.2
+  │
+  ├── (coordinator calls) → fleet-1 (CX23, machine-agent :8080, private 10.0.0.11)
+  ├── (coordinator calls) → fleet-2 (CX23, machine-agent :8080, private 10.0.0.12)
+  └── (coordinator calls) → fleet-3 (CX23, machine-agent :8080, private 10.0.0.13)
+
+Private network: 10.0.0.0/24
+  - Coordinator ↔ fleet machines (HTTP API calls)
+  - Fleet ↔ fleet (DRBD replication per user)
+```
+
+4 Hetzner Cloud CX23 servers at `nbg1`, all on the same private network.
+
+#### New Code Written
+
+**Coordinator (6 new files):**
+- `cmd/coordinator/main.go` — Entry point, env config, startup
+- `internal/coordinator/server.go` — HTTP routing (8 endpoints: fleet register/heartbeat/status, user CRUD, provision, bipod)
+- `internal/coordinator/store.go` — In-memory state store (`sync.RWMutex`), placement algorithm, port/minor allocation, JSON persistence
+- `internal/coordinator/provisioner.go` — Full provisioning state machine (8 steps, retry-once on failure)
+- `internal/coordinator/fleet.go` — Fleet management delegation
+- `internal/coordinator/machineapi.go` — HTTP client wrapping all 13 machine agent endpoints
+
+**Machine Agent Additions (2 modified + 1 new):**
+- `internal/machineagent/heartbeat.go` — Registration (retry until success) + 10-second heartbeat goroutine
+- `cmd/machine-agent/main.go` — Added `COORDINATOR_URL`, `NODE_ADDRESS` env vars, heartbeat startup
+- `internal/shared/types.go` — Added 10 new types for fleet and coordinator APIs
+
+**Infrastructure (schema + scripts):**
+- `schema.sql` — Postgres schema documentation (not used by code)
+- `Makefile` — Added coordinator build target
+- `scripts/layer-4.2/` — 7 files: run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh, cloud-init/coordinator.yaml, cloud-init/fleet.yaml
+
+#### Provisioning State Machine
+
+```
+REGISTERED → IMAGES_CREATED → DRBD_CONFIGURED → PRIMARY_PROMOTED → DRBD_SYNCED → BTRFS_FORMATTED → CONTAINER_STARTED → RUNNING
+```
+
+Key design: promote BEFORE sync wait (Issue #26 from Layer 4.1). Each step retries once on failure with 2-second backoff. DRBD sync polling every 2 seconds with 120-second timeout.
+
+#### Placement Algorithm
+
+1. Get all machines with status = "active"
+2. Filter: disk_used < disk_total × 0.85
+3. Sort by active_agents ascending
+4. Pick top 2 (least loaded)
+5. Increment active_agents under write lock to prevent double-placement
+
+#### Test Results — 55/55 Checks Passed (First Attempt)
+
+```
+═══ Phase 0: Prerequisites ═══                    [11/11]
+  ✓ Coordinator responding
+  ✓ 3 fleet machines registered
+  ✓ Machine agents responding (×3)
+  ✓ DRBD module loaded (×3)
+  ✓ Container image built (×3)
+
+═══ Phase 1: Provision First User (alice) ═══     [9/9]
+  ✓ Create, provision, reaches running
+  ✓ Status, primary machine, DRBD port, bipod entries verified
+  ✓ Container running on primary
+  ✓ Data accessible in container
+
+═══ Phase 2: Provision Second User (bob) ═══      [6/6]
+  ✓ Create, provision, running
+  ✓ Placed on fleet-2 (balanced)
+
+═══ Phase 3: Provision Third User (charlie) ═══   [3/3]
+  ✓ Running, placed on fleet-3
+
+═══ Phase 4: Provision dave and eve ═══           [5/5]
+  ✓ Both running, 5 total users
+
+═══ Phase 5: Fleet Status Verification ═══        [10/10]
+  ✓ 3 machines in fleet
+  ✓ Balanced: no machine has >4 agents
+  ✓ Machine status consistent (×3)
+  ✓ All 5 users accessible via coordinator
+
+═══ Phase 6: Data Isolation ═══                   [5/5]
+  ✓ Write unique data to alice and bob
+  ✓ Each reads only their own data
+  ✓ DRBD replication healthy (UpToDate)
+
+═══ Phase 7: Cleanup ═══                          [6/6]
+  ✓ All 3 machines cleaned
+  ✓ All 3 machines verified clean (0 users)
+
+═══════════════════════════════════════════════════
+ ALL PHASES COMPLETE: 55/55 checks passed
+═══════════════════════════════════════════════════
+```
+
+#### Issues Encountered
+
+None. All 55 checks passed on the first attempt. No code fixes were needed.
+
+This is notable because:
+- Layer 4.2 builds directly on the patterns and learnings from Layers 1-4.1
+- The master-prompt4.2.md was comprehensive and incorporated all critical learnings (promote-before-sync, device-mount pattern, private IP addressing, DRBD-first ordering)
+- The in-memory state store avoided any external dependency complexity
+
+#### What Was Proven
+
+1. **Coordinator → machine agent orchestration** — HTTP-based provisioning state machine drives the full block device stack across separate servers
+2. **Multi-user provisioning** — 5 users provisioned sequentially, each with their own DRBD resource, port, and container
+3. **Balanced placement** — Least-loaded algorithm distributes users across fleet: alice→fleet-1, bob→fleet-2, charlie→fleet-3, dave and eve spread across remaining capacity
+4. **Fleet registration and heartbeats** — Machine agents self-register and send heartbeats; coordinator tracks fleet state
+5. **Data isolation across users** — Each user's container sees only their own data; verified with unique writes and cross-reads
+6. **DRBD replication active for all users** — All user DRBD resources report UpToDate peer disk state
+7. **Clean teardown** — Machine agent cleanup endpoint releases all resources in correct dependency order
+
+#### Resource Teardown Verified
+
+After the run:
+- `l42-coordinator` — deleted
+- `l42-fleet-1` — deleted
+- `l42-fleet-2` — deleted
+- `l42-fleet-3` — deleted
+- `l42-net` — deleted
+- `l42-key` SSH key — deleted
+
+#### Drift Analysis
+
+No issues were encountered, so no drift analysis is needed. All established patterns were respected:
+- Promote before sync (Issue #26)
+- Device-mount container pattern (no host mounts at runtime)
+- DRBD-first ordering (blank images → DRBD → format)
+- AppArmor unconfined (already baked into machine agent)
+- Token-based DRBD parsing (coordinator reads JSON responses from machine agent)
+- Private IPs for coordinator↔machine communication
+- Proper teardown dependency chain
+
+#### Changes That Affect Future Layers
+
+1. **Layer 4.3 (failure detection)** — The coordinator now has fleet heartbeats. Layer 4.3 needs to add: heartbeat timeout detection, automatic DRBD promotion on secondary, container restart on new primary.
+
+2. **Layer 4.4 (bipod reformation)** — The coordinator tracks bipod state. Layer 4.4 needs to: detect single-copy state after failover, select a new secondary machine, test `drbdadm disconnect`/`adjust` for live peer replacement.
+
+3. **Layer 4.6 (crash recovery)** — The in-memory store persists to `state.json` but has no crash recovery logic. Layer 4.6 will migrate to Postgres and add startup reconciliation (compare coordinator state with machine agent reality).
+
+---
+
+## 7. Technology Decisions Log
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Replication copies | 2 (bipod) + Backblaze | 3 copies unnecessary for always-on; Backblaze is third tier |
+| DRBD protocol | Protocol A (async) | Near-local write speed; ~0-3s data loss on catastrophic failure acceptable |
+| DRBD version | 9.3.0 (LINBIT PPA) | Ubuntu 24.04 ships DRBD 8.4 in-tree; drbd-utils 9.22 requires 9.x kernel module |
+| DRBD metadata | `meta-disk internal`, always | DRBD set up before filesystem in all paths (provisioning + cold restore) |
+| User filesystem | Btrfs inside sparse image file | COW snapshots, instant rollback, portable, self-contained |
+| Host filesystem | XFS | Best for large files and concurrent I/O |
+| Container isolation | Device mount + init script | No metadata leakage; production pattern |
+| Container AppArmor | `--security-opt apparmor=unconfined` | Required on real Ubuntu 24.04 for mount inside container; discovered in Layer 4.1 |
+| Capability model | SYS_ADMIN + SETUID + SETGID during init, zero at runtime | Minimum viable for mount + user switch |
+| DRBD testing | Separate servers (not Docker containers) | DRBD requires separate kernels; shared-kernel approach is fundamentally impossible |
+| PoC infrastructure | Hetzner Cloud CX23 + hcloud CLI | Cheap (~€0.012/hr), automated lifecycle, production-realistic topology |
+| DinD storage driver | vfs (Docker Desktop), overlay2 (real Linux) | overlay2 doesn't work in nested Docker on Docker Desktop |
+| Coordinator HA | Start single, design for active-passive | All state in Postgres; advisory lock for leader election |
+| Pricing model | Usage-based metering | Fits bursty individual usage; agent negotiates resources |
+| Coordinator state | In-memory + JSON persist | No external deps for happy path; Postgres when crash recovery matters (Layer 4.6) |
+| Coordinator placement | Least-loaded, mutex-protected | Prevents double-placement from concurrent provisioning |
+| Fleet communication | Private IP HTTP | Coordinator uses 10.0.0.x addresses; test harness uses public IPs |
+| Open source | Yes, entire stack | WordPress.com/org model; trust through transparency |
+| Encryption | LUKS above DRBD (planned) | Protects data at rest; per-user keys in coordinator |
+| Backup compression | zstd | Fast, good ratio, streaming-compatible |
+| Backup transport | Temp file + B2 CLI upload | Reliable for PoC; production should use streaming for large deltas |
+| Backup chain tracking | manifest.json in B2 bucket | Tracks chain ordering, parent relationships, file sizes |
+| DRBD minor allocation | Per-machine from 0 (separate kernels) | No partitioned ranges needed; each kernel has its own minor namespace |
+
+---
+
+## 8. Key Files Produced
+
+| File | Description |
+|------|-------------|
+| `architecture-v3.md` | Full architecture document for the always-on bipod model |
+| `poc-btrfs/` | Working PoC: Btrfs world isolation with device-mount pattern |
+| `poc-btrfs/BUILD_PROMPT.md` | Build prompt for PoC 1 |
+| `poc-btrfs/UPDATE_PROMPT.md` | Patch 1: device mount isolation update |
+| `poc-drbd/` | Working PoC: DRBD bipod replication on Hetzner Cloud |
+| `poc-drbd/run.sh` | Full orchestration: infra up → provision → demo → teardown |
+| `poc-drbd/infra.sh` | Hetzner infrastructure lifecycle (up/down/status) |
+| `poc-drbd/cloud-init.yaml` | Server provisioning (DRBD 9, Docker, btrfs-progs) |
+| `poc-drbd/scripts/demo.sh` | 11-phase DRBD bipod demo (47/47 checks) |
+| `poc-drbd/scripts/container-init.sh` | Device-mount init script (reused from PoC 1) |
+| `poc-drbd/scripts/app-container/Dockerfile` | Isolated world container image |
+| `poc-backblaze/` | Working PoC: Backblaze B2 backup & cold restore |
+| `poc-backblaze/run.sh` | Full orchestration: infra + bucket up → demo → teardown all |
+| `poc-backblaze/infra.sh` | Hetzner lifecycle (up/down/status) |
+| `poc-backblaze/cloud-init.yaml` | Server provisioning (DRBD 9, Docker, btrfs, zstd, b2 CLI) |
+| `poc-backblaze/scripts/demo.sh` | 13-phase B2 backup & restore demo (65/65 checks) |
+| `poc-backblaze/scripts/container-init.sh` | Device-mount init script (reused from PoC 1/2) |
+| `poc-backblaze/scripts/app-container/Dockerfile` | Isolated world container image |
+| `poc-coordinator/` | Layer 4.1: Machine agent Go HTTP server (66/66 checks) |
+| `poc-coordinator/cmd/machine-agent/main.go` | Entry point, env config, startup |
+| `poc-coordinator/internal/machineagent/` | 8 Go files: server, images, drbd, btrfs, containers, state, cleanup, exec |
+| `poc-coordinator/container/` | Dockerfile + container-init.sh (device-mount pattern) |
+| `poc-coordinator/scripts/` | run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh, cloud-init/fleet.yaml |
+| `poc-coordinator/BUILD_PROMPT.md` | Build prompt for Layer 4.1 |
+| `poc-coordinator/cmd/coordinator/main.go` | Layer 4.2: Coordinator entry point |
+| `poc-coordinator/internal/coordinator/` | 5 Go files: server, store, provisioner, fleet, machineapi |
+| `poc-coordinator/internal/machineagent/heartbeat.go` | Registration + heartbeat goroutine |
+| `poc-coordinator/schema.sql` | Postgres schema documentation (future migration) |
+| `poc-coordinator/scripts/layer-4.2/` | run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh, cloud-init/ |
+| `master-prompt4.2.md` | Build prompt for Layer 4.2 |
+
+---
+
+## 9. PoC Progression Plan
+
+```
+✅ Layer 1: Btrfs world isolation (poc-btrfs)
+     Sparse images, subvolumes, containers, snapshots, rollback, isolation
+
+✅ Layer 1 Patch: Device mount isolation
+     No metadata leakage, production container pattern
+
+✅ Layer 2: DRBD bipod replication (poc-drbd)
+     Two real servers, Protocol A async replication, failover, data survival
+     47/47 checks passed
+
+✅ Layer 3: Backblaze B2 backup & restore (poc-backblaze)
+     btrfs send/receive, incremental backups, cold restore from B2
+     Full chain: backup → total loss → cold restore → bipod formation
+     65/65 checks passed (after Patch 3.1: DRBD-first ordering)
+
+✅ Layer 4.1: Machine agent (poc-coordinator)
+     Go HTTP server wrapping full block device stack
+     Device-mount containers on real servers, idempotent API, multi-user density
+     66/66 checks passed
+
+✅ Layer 4.2: Coordinator happy path (poc-coordinator)
+     Go coordinator with in-memory state, provisioning state machine
+     5 users across 3 fleet machines, balanced placement, data isolation
+     55/55 checks passed (first attempt, zero issues)
+
+🔲 Layer 4.3: Heartbeat + failure detection + failover
+     Heartbeat sender/monitor, machine death detection
+     Automatic promotion of surviving secondary, service restored
+
+🔲 Layer 4.4: Bipod reformation + dead machine return
+     Rebuild second copy after failover, zero-downtime DRBD peer replacement
+     Test drbdadm disconnect/adjust for live reconfiguration
+     Clean up orphaned resources on returning machines
+
+🔲 Layer 4.5: Suspension, reactivation, deletion
+     Full user lifecycle management
+
+🔲 Layer 4.6: Reconciliation + crash hardening
+     Startup reconciliation, deterministic fault injection (18 checkpoints)
+     Chaos mode testing, crash recovery from any partial state
+
+🔲 Layer 5: Live migration
+     Pause/promote/unpause for rebalancing
+
+🔲 Layer 6+: Agent integration, Telegram gateway, credential proxy,
+     marketplace, SDK, metering, dashboard...
+```
+
+**All data safety primitives are now proven:**
+- PoC 1: Data survives locally (snapshots, rollback)
+- PoC 2: Data survives machine failure (DRBD failover)
+- PoC 3: Data survives total fleet loss (B2 cold restore)
+
+**Orchestration automation has begun:**
+- Layer 4.1: Block device stack fully automated via Go HTTP API
+
+### Why Layer 4 Was Broken Into Sub-Layers
+
+The original Layer 4 build prompt attempted to go from "shell scripts on two machines" to "crash-resilient distributed orchestrator with chaos testing" in one step. This violated the layered learning approach that made Layers 1-3 successful — each layer teaches things that inform the next.
+
+The sub-layered approach caught three design issues in the original build prompt before they were baked in:
+
+1. **Container bind mounts instead of device-mount pattern** — the original Layer 4 build prompt used `-v /mnt/users/{id}/workspace:/workspace:rw`, which is exactly the pattern PoC 1 Patch 1 proved was wrong. Caught during pre-build review, corrected in the Layer 4.1 build prompt. Device-mount pattern used from day one.
+
+2. **"PoC shortcut" thinking for bipod reformation** — the original prompt said "production should use drbdadm adjust" but planned a full down/up cycle for the PoC. This defeats the purpose of building PoCs to learn production patterns. Layer 4.4 will test the real `disconnect`/`adjust` approach.
+
+3. **Unnecessary DRBD minor partitioning** — the original prompt used partitioned minor ranges (fleet-1: 0-99, fleet-2: 100-199) which was a workaround for shared-kernel testing. Since we're on separate Hetzner machines with separate kernels, minors start from 0 on each machine independently.
+
+---
+
+## 10. Critical Learnings
+
+### DRBD Cannot Be Simulated with Docker Containers
+
+DRBD is a kernel module with global state. Two containers on the same host share ONE kernel and therefore ONE DRBD instance. Replication requires two separate DRBD instances on two separate kernels talking over TCP. This is a fundamental architectural constraint, not a configuration issue.
+
+**Impact on the project:** The Docker Compose prototype layout (architecture-v3.md Section 16) assumed DinD containers could simulate fleet machines with DRBD. This doesn't work. Options for prototype/integration testing:
+- Multiple Hetzner Cloud servers (used in PoC 2, PoC 3, and Layer 4.1 — works perfectly, cheap)
+- Multiple Hetzner bare-metal servers (production target)
+- VMs with separate kernels on a host that supports nested virtualization
+
+Btrfs-only testing (snapshots, subvolumes, isolation) still works fine with Docker containers since Btrfs operates at the filesystem level, not the kernel module level.
+
+### DRBD 9 on Ubuntu 24.04 Requires LINBIT PPA
+
+Ubuntu 24.04 ships DRBD 8.4 in-tree but `drbd-utils` 9.22 in the package repos. These are incompatible. The LINBIT PPA provides the DRBD 9.3.0 kernel module via DKMS. When provisioning machines, must ensure `linux-headers-$(uname -r)` matches the running kernel before DKMS build.
+
+### DRBD Must Always Be Set Up Before the Filesystem
+
+When using `meta-disk internal`, DRBD reserves space at the end of the backing device for metadata. If a filesystem already occupies the full device, DRBD's `create-md` overwrites the filesystem's tail (~128KB), corrupting it. Discovered in PoC 3 when attempting to retrofit DRBD onto a Btrfs image restored from B2.
+
+**The rule:** Always set up DRBD on a blank device first, then format the filesystem on `/dev/drbdN`. This applies to all paths — normal provisioning, cold restore, migration. There are no exceptions. The cold restore flow is: blank image → loop → DRBD → promote → `mkfs.btrfs /dev/drbd0` → mount → `btrfs receive`.
+
+### DRBD Initial Sync Requires a Primary First
+
+A fresh DRBD resource starts with both sides Secondary/Inconsistent. No sync occurs until one side is promoted to Primary with `drbdadm primary --force`. The correct orchestration sequence is:
+
+```
+configure DRBD → drbdadm up → drbdadm primary --force → [sync starts] → wait for UpToDate/UpToDate
+```
+
+NOT: configure → up → wait for sync → promote. Sync never begins without a Primary. Discovered in Layer 4.1 (Issue 26). **This ordering is critical for Layer 4.2's provisioning state machine.**
+
+### DRBD 9 Status Parsing Must Be Token-Based
+
+DRBD 9 status lines contain multiple space-separated `key:value` tokens per line (e.g., `disk:UpToDate open:no`). Parsers must split on spaces and match by `key:value` prefix, not treat the whole line as a single value. The parser must also handle:
+- Connected format (with peer section)
+- Syncing format (with `done:` progress)
+- Disconnected format (no peer section)
+- Multi-resource output from `drbdadm status all`
+- Peer role shown as `hostname role:Secondary` (hostname prefix)
+
+### AppArmor on Real Ubuntu 24.04 Servers
+
+Docker's default AppArmor profile restricts the `mount` syscall even with `CAP_SYS_ADMIN`. The device-mount container pattern requires `--security-opt apparmor=unconfined`. This was invisible in PoC 1 because DinD runs inside a privileged container where AppArmor is inactive. Discovered in Layer 4.1 (Issue 27).
+
+The complete production container launch command is now:
+```bash
+docker run -d \
+  --name {user_id}-agent \
+  --device /dev/drbd{minor} \
+  --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETUID --cap-add SETGID \
+  --security-opt apparmor=unconfined \
+  --network none \
+  --memory 64m \
+  -e BLOCK_DEVICE=/dev/drbd{minor} \
+  -e SUBVOL_NAME=workspace \
+  platform/app-container
+```
+
+### Device-Mount Eliminates Host Mounts During Normal Operation
+
+After the one-time `format-btrfs` provisioning step (which temporarily mounts on the host to create subvolumes, then unmounts), the host never mounts the user's Btrfs again. The container handles its own mount internally via the init script. This means:
+- No host-side mount points active during normal operation
+- Failover is simpler: promote DRBD → start device-mount container (no host mount step)
+- Suspension is simpler: stop container (mount namespace dies with container, no separate unmount)
+
+### Teardown Must Respect the Dependency Chain
+
+Resources depend on each other in a stack. Teardown must proceed top-to-bottom:
+```
+container (holds mount namespace)
+  → DRBD device (held by mount)
+    → loop device (backing device for DRBD)
+      → image file (backing file for loop device)
+```
+
+Specifically: stop container → unmount (if host-mounted) → `drbdadm down` (while config file still exists) → remove config → `losetup -d` → delete image file. Calling `drbdadm down` after removing the config file fails because `drbdadm` needs the config to identify the resource. Discovered in Layer 4.1 (Issue 30).
+
+### The Production Block Device Stack Is Fully Validated
+
+The complete chain — sparse file → loop device → DRBD (Protocol A, `meta-disk internal`) → Btrfs → subvolume-per-world → device-mount containers → snapshots → failover → rollback — is proven working end-to-end across two independent servers. This is the exact production topology.
+
+Additionally, the complete backup and restore chain — `btrfs send → zstd → B2 upload → B2 download → zstd -d → btrfs receive` — is proven working, including incremental sends with parent tracking and manifest-based chain ordering.
+
+As of Layer 4.1, this entire stack is also proven to work when driven by a Go HTTP API, with idempotent endpoints, multi-user density, and proper resource teardown ordering.
+
+### btrfs send/receive Chain Ordering Is Mandatory
+
+`btrfs send -p parent child` produces an incremental stream that describes only the delta between parent and child. On the receiving end, `btrfs receive` requires the parent subvolume to already exist. Applying incrementals out of order fails. The manifest.json tracks the chain so the restore process applies snapshots in the correct sequence.
+
+Long chains make cold restores slow (each incremental must be downloaded and applied sequentially). Production should upload a fresh full send every 10 snapshots or monthly to reset the chain.
+
+---
+
+## 11. Drift Analysis: Layer 4.1
+
+When Layer 4.1 was completed, each fix was reviewed against the established patterns from PoCs 1-3 and the architecture to ensure no architectural drift was introduced.
+
+| Issue | Drift? | Assessment |
+|-------|--------|------------|
+| #24: SSH key path | No | Local environment detail |
+| #25: Token-based DRBD parser | No | Better implementation of existing parsing need |
+| #26: Promote before sync | No | **Corrects a bug in the build prompt**, restores PoC 2/3's proven ordering |
+| #27: AppArmor unconfined | No | Real production requirement discovered — DinD hid this. Acceptable given other security layers |
+| #28: Bash associative arrays | No | macOS compatibility, no architectural impact |
+| #29: docker top vs docker exec | No | Test methodology improvement, container pattern unchanged |
+| #30: Cleanup ordering | No | Correct implementation of dependency-aware teardown |
+
+**No drift detected.** All fixes either correct errors in the build prompt, discover real production requirements, or improve robustness. The device-mount pattern, DRBD-first ordering, capability model, and idempotent API design are all preserved exactly as designed.
+
+### Changes That Affect Future Layers
+
+Three discoveries from Layer 4.1 must be carried forward:
+
+1. **Layer 4.2 provisioning state machine** — must use promote → sync wait ordering (not sync wait → promote as in the original Layer 4 build prompt). The original Step 6 (DRBD_SYNCED) and Step 7 (PRIMARY_PROMOTED) must be swapped.
+
+2. **All container launches everywhere** — must include `--security-opt apparmor=unconfined` alongside the existing `--cap-drop ALL --cap-add SYS_ADMIN --cap-add SETUID --cap-add SETGID`.
+
+3. **All DRBD status parsing everywhere** — must use token-based parsing (split on spaces, match `key:value` prefixes), not line-based.
+
+---
+
+## 12. Open Questions / Future Decisions
+
+1. **Agent framework**: Which open-source agent loop to base on. Lightweight, persistent memory, cron, Telegram support.
+2. **Credential proxy design**: iptables + transparent proxy vs explicit proxy in containers.
+3. **Telegram gateway**: Single bot for thousands of users; rate limit handling (30 msg/sec per bot).
+4. **Inter-world communication protocol**: Message bus or API gateway mediated by SDK.
+5. **Marketplace protocol**: How apps declare capabilities, how upstream updates merge with customizations.
+6. **Modification-restricted zones**: Which app components agents can/cannot modify.
+7. **DRBD at scale**: 2,000 users × 2 copies = 4,000 resources, ~800-1,000 per machine. Needs benchmarking.
+8. **Host filesystem**: XFS vs ext4 — benchmark both.
+9. **Domain management**: How users connect their domain, agent handles DNS/SSL/routing.
+10. **Spending limit UX**: How the decision queue presents cost estimates and limit warnings.
+11. **Prototype architecture revision**: Docker Compose layout in architecture-v3.md Section 16 needs updating to account for DRBD's separate-kernel requirement. Options: multi-server compose with real VMs, or split testing (Btrfs in Docker, DRBD on real servers).
+12. **Architecture doc update**: Section 14.4 (cold restore) should explicitly state DRBD-first ordering — blank image → DRBD → mkfs → btrfs receive.
+13. **Streaming B2 uploads**: Production should pipe `btrfs send | zstd | b2 upload-unbound-stream` directly instead of temp files. Temp files require disk space proportional to snapshot delta size.
+14. **B2 chain maintenance**: Every 10 layers or monthly, upload fresh full send to reset the chain. Delete superseded incrementals.
+15. **DRBD peer replacement strategy**: Layer 4.4 will test whether `drbdadm disconnect` + config update + `drbdadm adjust` can replace a dead peer without taking down the primary's DRBD resource. If this works, bipod reformation is zero-downtime. If DRBD 9 has quirks with adjust, we'll discover the real workaround.
+16. **Custom AppArmor profile**: When internet-facing containers are added (with network access instead of `--network none`), a custom AppArmor profile that allows `mount` but restricts other operations may be warranted. For now, `apparmor=unconfined` is acceptable given cap-drop ALL + network none + unprivileged user.
+
+---
+
+## 13. Transition: PoC Directories → scfuture Repository
+
+### The Problem with Horizontal PoC Directories
+
+Layers 1-3 each lived in their own directory (`poc-btrfs/`, `poc-drbd/`, `poc-backblaze/`). This made sense — each PoC was a different technology stack with different scripts. But it created a structural problem: proven code was described in prose (SESSION.md) rather than carried forward as actual code. When the Layer 4 build prompt was written from prose descriptions, it regressed to bind mounts despite PoC 1 Patch 1 having already proven device-mount. The lesson existed as text, but the implementation wasn't inherited.
+
+Layer 4.1 (`poc-coordinator/`) was the first Go code and the first layer that future layers would build directly on top of. Continuing to create new directories per layer would mean copying code between directories, re-describing proven patterns in each build prompt, and risking drift every time.
+
+### The Move
+
+After Layer 4.1 passed 66/66 checks, the proven machine agent code was reorganized into `scfuture/` — the permanent project repository. The Go module name changed from `poc-coordinator` to `scfuture`. No business logic was modified. The only structural change was extracting HTTP API types into a `shared` package (`internal/shared/types.go`) so that both the machine agent and the future coordinator import the same type definitions — making API contract drift a compile error rather than a runtime surprise.
+
+Two untyped responses (`DRBDPromote` and `DRBDDemote` returning `map[string]interface{}`) were replaced with proper structs (`shared.DRBDPromoteResponse`, `shared.DRBDDemoteResponse`) with the same JSON keys, preserving backward compatibility with the test suite.
+
+### Package Structure After the Move
+
+```
+scfuture/
+├── cmd/machine-agent/          # Binary entry point (Layer 4.1)
+├── internal/
+│   ├── shared/                 # API contract — types both sides agree on
+│   └── machineagent/           # Machine agent implementation (proven, 66/66)
+├── container/                  # Dockerfile + init script (frozen from PoC 1 Patch 1)
+└── scripts/                    # Test harness + infrastructure (frozen from Layer 4.1)
+```
+
+Future layers add to this structure:
+
+```
+cmd/coordinator/                # Added in Layer 4.2
+internal/coordinator/           # Added in Layer 4.2
+internal/shared/                # Extended as API surface grows
+internal/machineagent/          # Small deltas (e.g., heartbeat endpoint in 4.3)
+```
+
+### How We Build From Now On
+
+**Git commits replace directories.** Each completed layer is a git commit on the same codebase. To see the state after Layer 4.1, check out that commit. No more `poc-btrfs/`, `poc-drbd/`, `poc-backblaze/`, `poc-coordinator/` proliferation.
+
+**Build prompts are delta documents.** Each layer's build prompt has three sections:
+1. **Existing code (read-only reference)** — files that already exist, listed so the AI reads them. Not rewritten.
+2. **Modifications to existing packages** — specific, scoped additions to proven code. "Add this endpoint to `machineagent/server.go`." Not "here's how containers work."
+3. **New code** — new packages or files created from scratch.
+
+**The shared package is the contract.** When the coordinator needs to call the machine agent, both sides import `scfuture/internal/shared`. Type agreement is enforced at compile time. If a field name changes in the machine agent's response, the coordinator won't compile until it's updated too.
+
+**Proven code is inherited, not re-described.** The build prompt for Layer 4.2 won't explain the device-mount pattern, the DRBD status parser, or the AppArmor flag. It will say "read `internal/machineagent/containers.go` — this is how containers are started." The AI reads the actual code, not a prose summary that might drift.
+
+**The machine agent package is mostly frozen.** Each layer may add small deltas (a new endpoint, an additional field in a response), but the core — image management, DRBD lifecycle, Btrfs formatting, container start/stop, cleanup — is proven and stable. The coordinator is the growing edge.
+
+### What This Means for SESSION.md
+
+This document continues to track learnings, issues, and drift analysis across layers. But it no longer needs to carry forward implementation details that are better expressed as code. "The production container launch command includes `--security-opt apparmor=unconfined`" is useful context here. But the authoritative source is now `internal/machineagent/containers.go`, not this document.

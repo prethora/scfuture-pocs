@@ -1,0 +1,59 @@
+#cloud-config
+package_update: true
+packages:
+  - btrfs-progs
+  - docker.io
+  - docker-buildx
+  - xfsprogs
+  - curl
+  - jq
+  - kmod
+  - software-properties-common
+
+runcmd:
+  # DRBD 9 from LINBIT PPA (Ubuntu 24.04 ships DRBD 8.4 in-tree, incompatible with drbd-utils 9.x)
+  - add-apt-repository -y ppa:linbit/linbit-drbd9-stack
+  - apt install -y drbd-dkms linux-headers-$(uname -r)
+  # Pre-seed postfix to avoid interactive prompt during drbd-utils install
+  - |
+    echo "postfix postfix/main_mailer_type select No configuration" | debconf-set-selections
+    echo "postfix postfix/mailname string localhost" | debconf-set-selections
+  - DEBIAN_FRONTEND=noninteractive apt install -y drbd-utils
+  - dkms autoinstall
+  - modprobe drbd
+
+  # Docker
+  - systemctl enable docker
+  - systemctl start docker
+  # Pre-pull alpine so container builds don't need to download at test time
+  - docker pull alpine:latest
+
+  # Storage directories
+  - mkdir -p /data/images /mnt/users
+
+  # Machine agent systemd service (binary + container files deployed separately)
+  - |
+    cat > /etc/systemd/system/machine-agent.service << 'EOF'
+    [Unit]
+    Description=Platform Machine Agent
+    After=network.target docker.service
+    Requires=docker.service
+    [Service]
+    Type=simple
+    ExecStart=/usr/local/bin/machine-agent
+    Environment=NODE_ID=PLACEHOLDER_NODE_ID
+    Environment=LISTEN_ADDR=0.0.0.0:8080
+    Environment=DATA_DIR=/data
+    Restart=on-failure
+    RestartSec=5
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+  - systemctl daemon-reload
+
+write_files:
+  - path: /etc/sysctl.d/99-drbd.conf
+    content: |
+      net.ipv4.tcp_keepalive_time = 60
+      net.ipv4.tcp_keepalive_intvl = 10
+      net.ipv4.tcp_keepalive_probes = 5

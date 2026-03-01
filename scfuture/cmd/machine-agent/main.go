@@ -30,6 +30,9 @@ func main() {
 		dataDir = "/data"
 	}
 
+	nodeAddress := os.Getenv("NODE_ADDRESS")
+	coordinatorURL := os.Getenv("COORDINATOR_URL")
+
 	agent := machineagent.NewAgent(nodeID, dataDir)
 
 	// Discover existing state
@@ -43,6 +46,15 @@ func main() {
 	// Register routes
 	mux := http.NewServeMux()
 	agent.RegisterRoutes(mux)
+
+	// Start heartbeat if coordinator URL is set
+	if coordinatorURL != "" {
+		if nodeAddress == "" {
+			nodeAddress = listenAddr
+		}
+		agent.StartHeartbeat(coordinatorURL, nodeAddress)
+		slog.Info("Heartbeat started", "coordinator", coordinatorURL, "node_address", nodeAddress)
+	}
 
 	slog.Info("Machine agent ready",
 		"node_id", nodeID,

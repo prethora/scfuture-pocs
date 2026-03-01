@@ -82,6 +82,74 @@ type StatusResponse struct {
 	Users       map[string]*UserStatusDTO `json:"users"`
 }
 
+// ─── Fleet types (from heartbeat.go / coordinator) ───
+
+type FleetRegisterRequest struct {
+	MachineID   string `json:"machine_id"`
+	Address     string `json:"address"`
+	DiskTotalMB int64  `json:"disk_total_mb"`
+	DiskUsedMB  int64  `json:"disk_used_mb"`
+	RAMTotalMB  int64  `json:"ram_total_mb"`
+	RAMUsedMB   int64  `json:"ram_used_mb"`
+	MaxAgents   int    `json:"max_agents"`
+}
+
+type FleetHeartbeatRequest struct {
+	MachineID     string   `json:"machine_id"`
+	DiskTotalMB   int64    `json:"disk_total_mb"`
+	DiskUsedMB    int64    `json:"disk_used_mb"`
+	RAMTotalMB    int64    `json:"ram_total_mb"`
+	RAMUsedMB     int64    `json:"ram_used_mb"`
+	ActiveAgents  int      `json:"active_agents"`
+	RunningAgents []string `json:"running_agents"`
+}
+
+// ─── Coordinator API types ───
+
+type CreateUserRequest struct {
+	UserID      string `json:"user_id"`
+	ImageSizeMB int    `json:"image_size_mb,omitempty"`
+}
+
+type CreateUserResponse struct {
+	UserID string `json:"user_id"`
+	Status string `json:"status"`
+}
+
+type UserDetailResponse struct {
+	UserID         string       `json:"user_id"`
+	Status         string       `json:"status"`
+	PrimaryMachine string       `json:"primary_machine"`
+	DRBDPort       int          `json:"drbd_port"`
+	Error          string       `json:"error,omitempty"`
+	Bipod          []BipodEntry `json:"bipod"`
+}
+
+type BipodEntry struct {
+	MachineID  string `json:"machine_id"`
+	Role       string `json:"role"`
+	DRBDMinor  int    `json:"drbd_minor"`
+	LoopDevice string `json:"loop_device"`
+}
+
+type FleetStatusResponse struct {
+	Machines []MachineStatus `json:"machines"`
+}
+
+type MachineStatus struct {
+	MachineID     string   `json:"machine_id"`
+	Address       string   `json:"address"`
+	Status        string   `json:"status"`
+	DiskTotalMB   int64    `json:"disk_total_mb"`
+	DiskUsedMB    int64    `json:"disk_used_mb"`
+	RAMTotalMB    int64    `json:"ram_total_mb"`
+	RAMUsedMB     int64    `json:"ram_used_mb"`
+	ActiveAgents  int      `json:"active_agents"`
+	MaxAgents     int      `json:"max_agents"`
+	RunningAgents []string `json:"running_agents"`
+	LastHeartbeat string   `json:"last_heartbeat"`
+}
+
 type UserStatusDTO struct {
 	ImageExists      bool   `json:"image_exists"`
 	ImagePath        string `json:"image_path"`
