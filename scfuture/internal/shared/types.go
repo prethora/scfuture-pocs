@@ -150,6 +150,37 @@ type MachineStatus struct {
 	LastHeartbeat string   `json:"last_heartbeat"`
 }
 
+// ─── DRBD disconnect/reconfigure types (from drbd.go, Layer 4.4) ───
+
+type DRBDDisconnectResponse struct {
+	Status       string `json:"status"`
+	WasConnected bool   `json:"was_connected"`
+}
+
+type DRBDReconfigureRequest struct {
+	Nodes []DRBDNode `json:"nodes"`
+	Port  int        `json:"port"`
+	Force bool       `json:"force"` // false=adjust only, true=down/up/promote
+}
+
+type DRBDReconfigureResponse struct {
+	Status string `json:"status"` // "reconfigured"
+	Method string `json:"method"` // "adjust" or "down_up"
+}
+
+// ─── Reformation types (from coordinator reformer) ───
+
+type ReformationEventResponse struct {
+	UserID       string `json:"user_id"`
+	OldSecondary string `json:"old_secondary"`
+	NewSecondary string `json:"new_secondary"`
+	Success      bool   `json:"success"`
+	Error        string `json:"error,omitempty"`
+	Method       string `json:"method,omitempty"` // "adjust" or "down_up"
+	DurationMS   int64  `json:"duration_ms"`
+	Timestamp    string `json:"timestamp"`
+}
+
 // ─── Failover types (from coordinator healthcheck) ───
 
 type FailoverEventResponse struct {

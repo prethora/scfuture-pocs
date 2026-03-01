@@ -92,6 +92,26 @@ func (c *MachineClient) ContainerStatus(userID string) (*shared.ContainerStatusR
 	return &resp, nil
 }
 
+func (c *MachineClient) DRBDDisconnect(userID string) (*shared.DRBDDisconnectResponse, error) {
+	var resp shared.DRBDDisconnectResponse
+	if err := c.doJSON("POST", fmt.Sprintf("/images/%s/drbd/disconnect", userID), nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) DRBDReconfigure(userID string, req *shared.DRBDReconfigureRequest) (*shared.DRBDReconfigureResponse, error) {
+	var resp shared.DRBDReconfigureResponse
+	if err := c.doJSON("POST", fmt.Sprintf("/images/%s/drbd/reconfigure", userID), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *MachineClient) DRBDDestroy(userID string) error {
+	return c.doJSON("DELETE", fmt.Sprintf("/images/%s/drbd", userID), nil, nil)
+}
+
 func (c *MachineClient) DeleteUser(userID string) error {
 	return c.doJSON("DELETE", fmt.Sprintf("/images/%s", userID), nil, nil)
 }

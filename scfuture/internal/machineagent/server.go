@@ -20,6 +20,8 @@ func (a *Agent) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /images/{user_id}/drbd/promote", a.handleDRBDPromote)
 	mux.HandleFunc("POST /images/{user_id}/drbd/demote", a.handleDRBDDemote)
 	mux.HandleFunc("GET /images/{user_id}/drbd/status", a.handleDRBDStatus)
+	mux.HandleFunc("POST /images/{user_id}/drbd/disconnect", a.handleDRBDDisconnect)
+	mux.HandleFunc("POST /images/{user_id}/drbd/reconfigure", a.handleDRBDReconfigure)
 	mux.HandleFunc("DELETE /images/{user_id}/drbd", a.handleDRBDDestroy)
 	mux.HandleFunc("POST /images/{user_id}/format-btrfs", a.handleFormatBtrfs)
 	mux.HandleFunc("POST /containers/{user_id}/start", a.handleContainerStart)
@@ -174,6 +176,40 @@ func (a *Agent) handleDRBDDestroy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *Agent) handleDRBDDisconnect(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+	lock := a.getUserLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	resp, err := a.DRBDDisconnect(userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *Agent) handleDRBDReconfigure(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("user_id")
+	lock := a.getUserLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var req shared.DRBDReconfigureRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	resp, err := a.DRBDReconfigure(userID, &req)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "")
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *Agent) handleFormatBtrfs(w http.ResponseWriter, r *http.Request) {

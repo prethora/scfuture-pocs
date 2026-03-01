@@ -155,10 +155,10 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 	}
 	logger.Info("Container started on surviving machine")
 
-	// Step 3: Update state
+	// Step 3: Update state — user is running but degraded (only 1 copy)
 	coord.store.SetBipodRole(userID, survivingBipod.MachineID, "primary")
 	coord.store.SetUserPrimary(userID, survivingBipod.MachineID)
-	coord.store.SetUserStatus(userID, "running", "")
+	coord.store.SetUserStatus(userID, "running_degraded", "primary failed over from "+deadMachineID)
 
 	coord.store.RecordFailoverEvent(FailoverEvent{
 		UserID:      userID,

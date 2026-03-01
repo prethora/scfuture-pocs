@@ -33,6 +33,9 @@ func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
 
 	// Failover events
 	mux.HandleFunc("GET /api/failovers", coord.handleGetFailovers)
+
+	// Reformation events
+	mux.HandleFunc("GET /api/reformations", coord.handleGetReformations)
 }
 
 func (coord *Coordinator) GetStore() *Store {
@@ -43,6 +46,14 @@ func (coord *Coordinator) handleGetFailovers(w http.ResponseWriter, r *http.Requ
 	events := coord.store.GetFailoverEvents()
 	if events == nil {
 		events = []FailoverEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+func (coord *Coordinator) handleGetReformations(w http.ResponseWriter, r *http.Request) {
+	events := coord.store.GetReformationEvents()
+	if events == nil {
+		events = []ReformationEvent{}
 	}
 	writeJSON(w, http.StatusOK, events)
 }

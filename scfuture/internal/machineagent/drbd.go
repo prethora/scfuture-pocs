@@ -204,6 +204,146 @@ func (a *Agent) DRBDDestroy(userID string) error {
 	return nil
 }
 
+func (a *Agent) DRBDDisconnect(userID string) (*shared.DRBDDisconnectResponse, error) {
+	if err := validateUserID(userID); err != nil {
+		return nil, err
+	}
+
+	resName := "user-" + userID
+
+	// Check current status
+	info := a.getDRBDStatus(resName)
+	if info == nil {
+		return nil, fmt.Errorf("DRBD resource %s does not exist", resName)
+	}
+
+	// If already StandAlone or no peer connection, return success
+	if info.ConnectionState == "StandAlone" {
+		slog.Info("DRBD already disconnected (StandAlone)", "component", "drbd", "user", userID)
+		return &shared.DRBDDisconnectResponse{Status: "disconnected", WasConnected: false}, nil
+	}
+
+	result, err := runCmd("drbdadm", "disconnect", resName)
+	if err != nil {
+		return nil, cmdError("drbdadm disconnect failed", cmdString("drbdadm", "disconnect", resName), result)
+	}
+
+	slog.Info("DRBD disconnected from peer", "component", "drbd", "user", userID)
+	return &shared.DRBDDisconnectResponse{Status: "disconnected", WasConnected: true}, nil
+}
+
+func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureRequest) (*shared.DRBDReconfigureResponse, error) {
+	if err := validateUserID(userID); err != nil {
+		return nil, err
+	}
+	if len(req.Nodes) != 2 {
+		return nil, fmt.Errorf("exactly 2 nodes required")
+	}
+
+	resName := "user-" + userID
+	configPath := fmt.Sprintf("/etc/drbd.d/%s.res", resName)
+
+	// Write new config file (same format as DRBDCreate)
+	config := fmt.Sprintf(`resource %s {
+    net {
+        protocol A;
+        max-buffers 8000;
+        max-epoch-size 8000;
+        sndbuf-size 0;
+        rcvbuf-size 0;
+    }
+    disk {
+        on-io-error detach;
+    }
+    on %s {
+        device /dev/drbd%d minor %d;
+        disk %s;
+        address %s:%d;
+        meta-disk internal;
+    }
+    on %s {
+        device /dev/drbd%d minor %d;
+        disk %s;
+        address %s:%d;
+        meta-disk internal;
+    }
+}
+`, resName,
+		req.Nodes[0].Hostname, req.Nodes[0].Minor, req.Nodes[0].Minor, req.Nodes[0].Disk, req.Nodes[0].Address, req.Port,
+		req.Nodes[1].Hostname, req.Nodes[1].Minor, req.Nodes[1].Minor, req.Nodes[1].Disk, req.Nodes[1].Address, req.Port,
+	)
+
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		return nil, fmt.Errorf("write DRBD config: %w", err)
+	}
+
+	if !req.Force {
+		// Try adjust
+		result, err := runCmd("drbdadm", "adjust", resName)
+		if err == nil {
+			slog.Info("DRBD reconfigured via adjust", "component", "drbd", "user", userID)
+
+			// Update in-memory state with new peer info
+			hostname, _ := os.Hostname()
+			u := a.getUser(userID)
+			if u != nil {
+				for _, n := range req.Nodes {
+					if n.Hostname == hostname {
+						u.DRBDMinor = n.Minor
+						u.DRBDDevice = fmt.Sprintf("/dev/drbd%d", n.Minor)
+					}
+				}
+				a.setUser(userID, u)
+			}
+
+			return &shared.DRBDReconfigureResponse{Status: "reconfigured", Method: "adjust"}, nil
+		}
+		slog.Warn("drbdadm adjust failed", "component", "drbd", "user", userID, "error", err, "output", result.Stderr)
+		// Return error — coordinator will handle fallback
+		return nil, fmt.Errorf("adjust failed (stderr: %s), coordinator should retry with force=true", result.Stderr)
+	}
+
+	// Force path: full down/up/promote cycle
+	// The coordinator is responsible for stopping/starting the container around this call
+	slog.Info("DRBD reconfigure via down/up (force)", "component", "drbd", "user", userID)
+
+	// Unmount host if mounted (safety)
+	mountPath := a.mountPath(userID)
+	if isMounted(mountPath) {
+		runCmd("umount", mountPath)
+	}
+
+	// Down
+	runCmd("drbdadm", "down", resName)
+
+	// Up (uses new config)
+	result, err := runCmd("drbdadm", "up", resName)
+	if err != nil {
+		return nil, cmdError("drbdadm up failed after reconfigure", cmdString("drbdadm", "up", resName), result)
+	}
+
+	// Promote back to primary
+	result, err = runCmd("drbdadm", "primary", "--force", resName)
+	if err != nil {
+		return nil, cmdError("drbdadm primary failed after reconfigure", cmdString("drbdadm", "primary", "--force", resName), result)
+	}
+
+	// Update in-memory state
+	hostname, _ := os.Hostname()
+	u := a.getUser(userID)
+	if u != nil {
+		for _, n := range req.Nodes {
+			if n.Hostname == hostname {
+				u.DRBDMinor = n.Minor
+				u.DRBDDevice = fmt.Sprintf("/dev/drbd%d", n.Minor)
+			}
+		}
+		a.setUser(userID, u)
+	}
+
+	return &shared.DRBDReconfigureResponse{Status: "reconfigured", Method: "down_up"}, nil
+}
+
 func (a *Agent) getDRBDStatus(resName string) *DRBDInfo {
 	result, err := runCmd("drbdadm", "status", resName)
 	if err != nil {

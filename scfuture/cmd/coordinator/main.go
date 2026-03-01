@@ -28,6 +28,9 @@ func main() {
 	// Start health checker
 	coordinator.StartHealthChecker(coord.GetStore(), coordinator.NewMachineClient(""), coord)
 
+	// Start reformer
+	coordinator.StartReformer(coord.GetStore(), coord)
+
 	mux := http.NewServeMux()
 	coord.RegisterRoutes(mux)
 

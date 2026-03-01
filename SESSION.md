@@ -1853,3 +1853,190 @@ internal/machineagent/          # Small deltas (e.g., heartbeat endpoint in 4.3)
 ### What This Means for SESSION.md
 
 This document continues to track learnings, issues, and drift analysis across layers. But it no longer needs to carry forward implementation details that are better expressed as code. "The production container launch command includes `--security-opt apparmor=unconfined`" is useful context here. But the authoritative source is now `internal/machineagent/containers.go`, not this document.
+
+---
+
+## 11. Layer 4.4 — Bipod Reformation & Dead Machine Re-integration
+
+### What Layer 4.4 Built
+
+Automatic bipod reformation: when a user loses their secondary (or has their primary fail over), the reformer restores 2-copy replication by provisioning a new secondary on a different fleet machine.
+
+**New Go code:**
+- `internal/coordinator/reformer.go` — Background goroutine (30s tick) that:
+  1. Cleans stale bipods on machines that have returned to active
+  2. Scans for `running_degraded` users past a 30s stabilization period
+  3. For each degraded user: selects new secondary → creates image → configures DRBD → disconnects dead peer on primary → reconfigures primary to new peer → waits for sync
+- `internal/machineagent/drbd.go` — Added `DRBDDisconnect` (idempotent disconnect from peer) and `DRBDReconfigure` (rewrite config + adjust, with down/up fallback)
+- `internal/coordinator/store.go` — Added `StatusChangedAt` to User, `ReformationEvent` struct, and methods: `GetDegradedUsers`, `GetStaleBipodsOnActiveMachines`, `GetAllStaleBipodsOnActiveMachines`, `RemoveBipod`, `SelectOneSecondary`, `RecordReformationEvent`, `GetReformationEvents`
+- `internal/coordinator/server.go` — Added `GET /api/reformations` endpoint
+- `internal/coordinator/machineapi.go` — Added `DRBDDisconnect`, `DRBDReconfigure`, `DRBDDestroy` client methods
+- `internal/coordinator/healthcheck.go` — Fixed primary-died failover to set `running_degraded` (not `running`)
+
+**New test scripts:** `scripts/layer-4.4/` with full 10-phase integration test.
+
+### Test Results
+
+**91/91 checks passed** across 10 phases:
+- Phase 0: Prerequisites (14/14)
+- Phase 1: Provision Users baseline (15/15)
+- Phase 2: Kill fleet machine (2/2)
+- Phase 3: Failure Detection & Failover (6/6)
+- Phase 4: Verify Degraded State (9/9)
+- Phase 5: Wait for Bipod Reformation (9/9)
+- Phase 6: DRBD Sync & Data Integrity (12/12)
+- Phase 7: Dead Machine Return & Cleanup (7/7)
+- Phase 8: Coordinator State Consistency (8/8)
+- Phase 9: Reformation Events (3/3)
+- Phase 10: Cleanup (6/6)
+
+### Key Technical Finding: `drbdadm adjust` Works
+
+**All 3 reformations used `drbdadm adjust` — zero downtime.** The down/up fallback was never needed.
+
+When the primary's DRBD peer dies and goes StandAlone, the reconfigure flow:
+1. Write new config file pointing to new peer
+2. `drbdadm adjust <resource>` — DRBD reads the new config, sees the new peer address, and connects
+
+The primary's container kept running throughout. DRBD handled the peer swap seamlessly. This confirms that peer replacement on a running primary is a zero-downtime operation.
+
+Reformation timing: ~8.2 seconds per user (measured from "reforming" to "running"), dominated by DRBD sync of the 512MB image.
+
+### Issues Encountered and Fixes
+
+**Issue 24 (Layer 4.4): Primary-died failover set status to "running" instead of "running_degraded"**
+
+The Layer 4.3 healthcheck's primary-died path set the user to `"running"` after successful failover. But the user only has 1 copy at that point — they should be `"running_degraded"` so the reformer picks them up. Fixed in `healthcheck.go`.
+
+**Issue 25 (Layer 4.4): Machine-agent service not enabled for auto-start on reboot**
+
+`deploy.sh` used `systemctl start` but not `systemctl enable`. When fleet-1 was powered off and back on, the machine-agent didn't auto-start, so it couldn't resume heartbeats. Fixed: `systemctl enable --now`.
+
+**Issue 26 (Layer 4.4): Stale bipods not cleaned up after reformation**
+
+The reformer's stale cleanup only ran during the `reformUser` flow for degraded users. After reformation completed (user → "running"), stale bipods on the dead machine persisted. When the dead machine returned to active, nobody cleaned them up. Fixed: added `cleanStaleBipodsOnActiveMachines()` that runs on every reformer tick, independent of user status.
+
+**Issue 27 (Layer 4.4): Test assumed all users have bipods on fleet-1**
+
+With 3 users and 3 machines, placement is non-deterministic. Some users may have no bipods on fleet-1 at all. Fixed test to be placement-aware: only check degraded state for users that actually had bipods on the killed machine.
+
+### Drift from Build Prompt
+
+1. **Added `cleanStaleBipodsOnActiveMachines()` to reformer** — the prompt only described stale cleanup as part of the `reformUser` flow (Step 0). This is insufficient because users transition to "running" after reformation, and the dead machine may return later. The separate cleanup pass handles this case.
+
+2. **Added `GetAllStaleBipodsOnActiveMachines()` to store** — new method not in the prompt, needed for the cleanup pass.
+
+3. **Added `DRBDDestroy` client method to machineapi.go** — the prompt's reformer code called `client.DRBDDestroy()` but it wasn't listed in the machineapi.go modifications. Added it.
+
+4. **Changed healthcheck.go failover result from "running" to "running_degraded"** — this was a bug in Layer 4.3 code that prevented the reformer from working correctly. The prompt's reformation flow depends on users being in "running_degraded" state.
+
+5. **`systemctl enable --now` instead of `systemctl start`** — not specified in the prompt's deploy.sh, but required for the dead machine return test to work.
+
+6. **Private IPs auto-assigned (10.0.0.3-5) instead of prompt's 10.0.0.11-13** — Hetzner assigns IPs during `--network` server creation before `attach-to-network` with specific IPs can succeed. Functionally identical since code uses registered addresses.
+
+### Architectural Drift Review: All Layer 4 Issues vs architecture-v3.md
+
+After completing Layer 4.4, all issues across Layer 4 (Issues #24–#31 from L4.1, #31 from L4.3, #24–#27 from L4.4) were reviewed against architecture-v3.md to check for drift that might solve surface problems while contradicting the bigger picture.
+
+#### No Drift (Confirmed Aligned)
+
+| Issue | Assessment |
+|-------|-----------|
+| L4.1 #24: SSH key path | Env detail, no arch impact |
+| L4.1 #25: DRBD parser tokens | Better implementation of existing need |
+| L4.1 #26: Promote before sync | Corrects a sequencing bug; architecture Section 7.1 implies this ordering |
+| L4.1 #28: Bash 3.2 compat | macOS compat, no arch impact |
+| L4.1 #29: docker top vs exec | Test methodology |
+| L4.1 #30: Cleanup ordering | Correct implementation of dependency teardown |
+| L4.3 #31: Placement-aware tests | Test fix only |
+| L4.4 #25: systemctl enable | Operational fix, no arch impact |
+| L4.4 #27: Placement-aware tests | Test fix only |
+
+#### Positive Drift (Better Than Architecture, Doc Needs Update)
+
+**1. Device-mount pattern vs bind mounts.** Architecture-v3.md Section 15.2 says "Bind mount to `/workspace`." We use block device via `--device`, mount from inside the container. This is better — no host mount points during normal operation, no metadata leakage in `/proc/mounts`. Proven in PoC 1 Patch 1, carried through all layers. Architecture doc is stale.
+
+**2. No host-side Btrfs mount during normal operation.** Architecture Section 3.2 shows `Btrfs filesystem mounted at /mnt/users/alice` as steady-state. Section 7.1 says "Mount Btrfs on fleet-5" during failover. In reality, the host NEVER mounts Btrfs during normal operation or failover — the container handles its own mount. Host mount only happens during the one-time `format-btrfs` provisioning step. Simplifies failover (promote DRBD → start container, no mount step) and eliminates host mount points as attack surface.
+
+**3. DRBD backing device is loop, not raw file.** Architecture Section 4.2 config shows `disk /data/images/alice.img`. DRBD requires a block device — we use `losetup` to create a loop device. Corrected in PoC 2, carried forward everywhere.
+
+#### Drift That Warrants Attention
+
+**4. User states expanded beyond the architecture's 4-state model.**
+
+Architecture Section 6 defines: `provisioning | running | suspended | evicted`. We added `running_degraded`, `failing_over`, and `reforming` as internal operational states. These are necessary — the reformer depends on `running_degraded` to find users needing bipod restoration.
+
+**Hard requirement for Layer 6+:** The user-facing API layer (Telegram gateway, dashboard) MUST map `running_degraded`, `failing_over`, and `reforming` all to `running` from the end user's perspective. These internal states are operational metadata, not user-visible lifecycle states. If they ever leak to user-facing APIs, it contradicts the architecture's clean 4-state lifecycle.
+
+**5. Failover timing: 60s vs architecture's 30s.**
+
+Architecture Section 8.2 says "Marks machines offline after 30s." We use 30s to `suspect`, 60s to `dead`. This was deliberate — reduces false positives from transient network issues. Combined with the reformer's 30s stabilization period, a user whose primary dies may not have their bipod reformed until ~90–120s after the machine died. Still well within the architecture's "10 minute" reformation target (Section 7.2), but the detection window is doubled.
+
+**6. Reformation triggered by polling, not by failover event.**
+
+Architecture Section 7.1 says reformation happens "Asynchronously" after failover — implying it's triggered by the failover event itself. We use a 30s polling loop with 30s stabilization — up to 60s delay before reformation starts. The polling approach is simpler and more resilient (works after coordinator restart, catches missed events). For production, consider having the failover code directly trigger a reformation attempt to reduce single-copy exposure time, with the polling loop as a safety net.
+
+**7. `--network none` vs architecture's per-user Docker network.**
+
+Architecture Section 15.1 says containers share `user-alice-net`. We use `--network none`. Correct for now — the current container has no networking needs. But when Layer 6+ adds real agent containers with Telegram access and app servers, this must change to a per-user bridge network with the credential proxy as the only egress path. No risk now, but the architecture's multi-container model hasn't been tested.
+
+#### Architecture Doc Sections That Need Updating
+
+| Section | What's Wrong | Correct Value |
+|---------|-------------|---------------|
+| 3.2 | Shows host-side Btrfs mount as steady state | Host mount only during provisioning; container mounts internally |
+| 4.2 | `disk /data/images/alice.img` | `disk /dev/loopN` (loop device) |
+| 4.4 | Minor partitioning for shared-kernel | Per-machine from 0 (separate kernels) |
+| 7.1 | "Mount Btrfs on fleet-5" during failover | No host mount; start device-mount container |
+| 14.4 | `mount -o loop` then DRBD after | DRBD first on blank device, then format, then btrfs receive |
+| 15.2 | "Bind mount to `/workspace`" | Device-mount pattern (block device via `--device`) |
+| 16.x | Docker Compose prototype | Known non-viable for DRBD (shared kernel) |
+
+#### Verdict
+
+**No harmful drift.** Every fix either corrected an error in the build prompt, discovered a real production requirement, or added necessary operational states. The core architectural commitments — bipod replication, block device stack, coordinator/agent split, failure recovery, DRBD Protocol A — are all intact and proven. The main thing to enforce going forward: internal operational states (`running_degraded`, `failing_over`, `reforming`) must never surface to end users.
+
+---
+
+### Layer 4.5 Preview: Suspension, Reactivation, and Deletion
+
+#### What It Aims to Prove
+
+Layers 4.1–4.4 proved the platform can keep users alive through failures: provision, replicate, fail over, reform. Layer 4.5 proves the platform can cleanly **park users, bring them back, and clean up after them** — completing the architecture's full 4-state user lifecycle (`provisioning → running → suspended → evicted`).
+
+#### Capabilities
+
+1. **Suspension** (architecture Section 6.3) — When a user cancels/pauses their subscription: stop containers gracefully, take a final Btrfs snapshot, DRBD stays connected (images warm on both machines for fast reactivation), user status → `suspended`. The agent is parked, not destroyed — data stays on fleet.
+
+2. **Reactivation — warm path** (architecture Section 6.4, Case A) — User resubscribes while images are still on fleet: DRBD reconnected if disconnected, promote primary, start containers. Should be near-instant.
+
+3. **Reactivation — cold path** (architecture Section 6.4, Case B) — User resubscribes after eviction (images deleted, only B2 backup remains): pick 2 machines, download snapshot chain from B2, btrfs receive, form bipod, start containers. This is the PoC 3 (Backblaze) flow, but driven by the coordinator instead of a bash script.
+
+4. **Deletion/Eviction** (architecture Section 12) — Full cleanup: DRBD destroyed, image files deleted on all fleet machines, user status → `evicted`. Safety rule: never delete the last fleet copy until B2 backup is verified.
+
+#### What's Architecturally Interesting
+
+- **First layer touching Backblaze B2 from Go code** — cold restore needs the coordinator to drive B2 downloads through the machine agent. All previous B2 work was bash scripts (PoC 3).
+- **DRBD disconnect/reconnect cycle for suspension** — different from reformation's disconnect (here both sides are alive, just parked). Tests whether DRBD bitmap resync works correctly after a clean disconnect + reconnect.
+- **Tiered retention model** — suspended < 7 days (DRBD connected), 7–30 days (DRBD disconnected, images retained), > 30 days (evicted to B2 only). The coordinator needs a background process to enforce these time-based transitions.
+- **Completes the 4-state lifecycle** — after this layer, all states from architecture Section 6 have been implemented and tested.
+
+#### Already Proven (Not Re-tested)
+
+- Block device stack, DRBD replication, failover, reformation — Layers 4.1–4.4
+- B2 backup/restore mechanics — PoC 3/Patch 3.1 (but needs to be wired into Go coordinator)
+- Container start/stop — every layer
+
+---
+
+### PoC Progression
+
+```
+Layer 4.1: Machine Agent PoC                    ✅ 66/66 checks
+Layer 4.2: Coordinator Happy Path               ✅ 55/55 checks
+Layer 4.3: Heartbeat Failure Detection           ✅ 62/62 checks
+Layer 4.4: Bipod Reformation                     ✅ 91/91 checks
+Layer 4.5: Suspension / Reactivation / Deletion  ⬜ Next
+Layer 4.6: Crash Recovery / Reconciliation       ⬜
+Layer 5:   Live Migration                        ⬜
+```

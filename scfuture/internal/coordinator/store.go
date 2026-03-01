@@ -13,6 +13,17 @@ import (
 	"scfuture/internal/shared"
 )
 
+type ReformationEvent struct {
+	UserID       string    `json:"user_id"`
+	OldSecondary string    `json:"old_secondary"`
+	NewSecondary string    `json:"new_secondary"`
+	Success      bool      `json:"success"`
+	Error        string    `json:"error,omitempty"`
+	Method       string    `json:"method,omitempty"` // "adjust" or "down_up"
+	DurationMS   int64     `json:"duration_ms"`
+	Timestamp    time.Time `json:"timestamp"`
+}
+
 type Store struct {
 	mu       sync.RWMutex
 	machines map[string]*Machine
@@ -22,7 +33,8 @@ type Store struct {
 	nextPort  int            // next DRBD port to allocate (starts at 7900)
 	nextMinor map[string]int // per-machine next DRBD minor (starts at 0)
 
-	failoverEvents []FailoverEvent
+	failoverEvents    []FailoverEvent
+	reformationEvents []ReformationEvent
 
 	dataDir string
 }
@@ -55,13 +67,14 @@ type FailoverEvent struct {
 }
 
 type User struct {
-	UserID         string    `json:"user_id"`
-	Status         string    `json:"status"`
-	PrimaryMachine string    `json:"primary_machine"`
-	DRBDPort       int       `json:"drbd_port"`
-	ImageSizeMB    int       `json:"image_size_mb"`
-	Error          string    `json:"error"`
-	CreatedAt      time.Time `json:"created_at"`
+	UserID          string    `json:"user_id"`
+	Status          string    `json:"status"`
+	StatusChangedAt time.Time `json:"status_changed_at"`
+	PrimaryMachine  string    `json:"primary_machine"`
+	DRBDPort        int       `json:"drbd_port"`
+	ImageSizeMB     int       `json:"image_size_mb"`
+	Error           string    `json:"error"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 type Bipod struct {
@@ -208,6 +221,7 @@ func (s *Store) SetUserStatus(userID, status, errMsg string) {
 		return
 	}
 	u.Status = status
+	u.StatusChangedAt = time.Now()
 	u.Error = errMsg
 	s.persist()
 }
@@ -326,12 +340,13 @@ func (s *Store) SelectMachines() (primary *Machine, secondary *Machine, err erro
 }
 
 type persistState struct {
-	Machines       map[string]*Machine `json:"machines"`
-	Users          map[string]*User    `json:"users"`
-	Bipods         map[string]*Bipod   `json:"bipods"`
-	NextPort       int                 `json:"next_port"`
-	NextMinor      map[string]int      `json:"next_minor"`
-	FailoverEvents []FailoverEvent     `json:"failover_events"`
+	Machines          map[string]*Machine  `json:"machines"`
+	Users             map[string]*User     `json:"users"`
+	Bipods            map[string]*Bipod    `json:"bipods"`
+	NextPort          int                  `json:"next_port"`
+	NextMinor         map[string]int       `json:"next_minor"`
+	FailoverEvents    []FailoverEvent      `json:"failover_events"`
+	ReformationEvents []ReformationEvent   `json:"reformation_events"`
 }
 
 func (s *Store) persist() {
@@ -339,12 +354,13 @@ func (s *Store) persist() {
 		return
 	}
 	state := persistState{
-		Machines:       s.machines,
-		Users:          s.users,
-		Bipods:         s.bipods,
-		NextPort:       s.nextPort,
-		NextMinor:      s.nextMinor,
-		FailoverEvents: s.failoverEvents,
+		Machines:          s.machines,
+		Users:             s.users,
+		Bipods:            s.bipods,
+		NextPort:          s.nextPort,
+		NextMinor:         s.nextMinor,
+		FailoverEvents:    s.failoverEvents,
+		ReformationEvents: s.reformationEvents,
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -459,5 +475,125 @@ func (s *Store) GetFailoverEvents() []FailoverEvent {
 	defer s.mu.RUnlock()
 	result := make([]FailoverEvent, len(s.failoverEvents))
 	copy(result, s.failoverEvents)
+	return result
+}
+
+// GetDegradedUsers returns users in running_degraded status whose
+// StatusChangedAt is older than the stabilization period.
+func (s *Store) GetDegradedUsers(stabilizationPeriod time.Duration) []*User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*User
+	now := time.Now()
+	for _, u := range s.users {
+		if u.Status == "running_degraded" && now.Sub(u.StatusChangedAt) > stabilizationPeriod {
+			clone := *u
+			result = append(result, &clone)
+		}
+	}
+	return result
+}
+
+// GetStaleBipodsOnActiveMachines returns stale bipods for a user that are
+// on machines currently in "active" status. These need cleanup before reformation.
+func (s *Store) GetStaleBipodsOnActiveMachines(userID string) []*Bipod {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*Bipod
+	for _, b := range s.bipods {
+		if b.UserID == userID && b.Role == "stale" {
+			m, ok := s.machines[b.MachineID]
+			if ok && m.Status == "active" {
+				clone := *b
+				result = append(result, &clone)
+			}
+		}
+	}
+	return result
+}
+
+// RemoveBipod removes a specific bipod entry for a user.
+func (s *Store) RemoveBipod(userID, machineID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := userID + ":" + machineID
+	delete(s.bipods, key)
+	s.persist()
+}
+
+// SelectOneSecondary picks the least-loaded active machine, excluding the
+// specified machine IDs. Increments active_agents on the selected machine.
+func (s *Store) SelectOneSecondary(excludeMachineIDs []string) (*Machine, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	exclude := make(map[string]bool)
+	for _, id := range excludeMachineIDs {
+		exclude[id] = true
+	}
+
+	var candidates []*Machine
+	for _, m := range s.machines {
+		if m.Status != "active" {
+			continue
+		}
+		if exclude[m.MachineID] {
+			continue
+		}
+		if m.DiskTotalMB > 0 && m.DiskUsedMB > int64(float64(m.DiskTotalMB)*0.85) {
+			continue
+		}
+		candidates = append(candidates, m)
+	}
+
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no available active machine (excluding %v)", excludeMachineIDs)
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].ActiveAgents < candidates[j].ActiveAgents
+	})
+
+	candidates[0].ActiveAgents++
+	result := *candidates[0]
+	s.persist()
+	return &result, nil
+}
+
+// GetAllStaleBipodsOnActiveMachines returns all stale bipods across all users
+// that are on machines currently in "active" status.
+func (s *Store) GetAllStaleBipodsOnActiveMachines() []*Bipod {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []*Bipod
+	for _, b := range s.bipods {
+		if b.Role == "stale" {
+			m, ok := s.machines[b.MachineID]
+			if ok && m.Status == "active" {
+				clone := *b
+				result = append(result, &clone)
+			}
+		}
+	}
+	return result
+}
+
+// RecordReformationEvent appends a reformation event.
+func (s *Store) RecordReformationEvent(event ReformationEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reformationEvents = append(s.reformationEvents, event)
+	s.persist()
+}
+
+// GetReformationEvents returns all recorded reformation events.
+func (s *Store) GetReformationEvents() []ReformationEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]ReformationEvent, len(s.reformationEvents))
+	copy(result, s.reformationEvents)
 	return result
 }
