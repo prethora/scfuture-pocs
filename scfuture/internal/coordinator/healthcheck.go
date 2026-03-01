@@ -117,8 +117,17 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 		"surviving_machine", survivingBipod.MachineID,
 	)
 
+	opID := generateOpID()
+	coord.store.CreateOperation(opID, "failover", userID, map[string]interface{}{
+		"dead_machine":      deadMachineID,
+		"surviving_machine": survivingBipod.MachineID,
+		"surviving_address": survivingMachine.Address,
+	})
+
 	coord.store.SetUserStatus(userID, "failing_over", "")
 	coord.store.SetBipodRole(userID, deadMachineID, "stale")
+
+	coord.step(opID, "failover-detected")
 
 	client := NewMachineClient(survivingMachine.Address)
 
@@ -127,6 +136,7 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 	if err != nil {
 		logger.Error("DRBD promote failed", "error", err)
 		coord.store.SetUserStatus(userID, "unavailable", "drbd promote failed: "+err.Error())
+		coord.store.FailOperation(opID, "drbd promote: "+err.Error())
 		coord.store.RecordFailoverEvent(FailoverEvent{
 			UserID:      userID,
 			FromMachine: deadMachineID,
@@ -140,6 +150,7 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 		return
 	}
 	logger.Info("DRBD promoted on surviving machine")
+	coord.step(opID, "failover-promoted")
 
 	// Step 2: Start container on surviving machine
 	_, err = client.ContainerStart(userID)
@@ -148,6 +159,7 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 		coord.store.SetBipodRole(userID, survivingBipod.MachineID, "primary")
 		coord.store.SetUserPrimary(userID, survivingBipod.MachineID)
 		coord.store.SetUserStatus(userID, "running_degraded", "container start failed after promote: "+err.Error())
+		coord.store.FailOperation(opID, "container start: "+err.Error())
 		coord.store.RecordFailoverEvent(FailoverEvent{
 			UserID:      userID,
 			FromMachine: deadMachineID,
@@ -161,11 +173,13 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 		return
 	}
 	logger.Info("Container started on surviving machine")
+	coord.step(opID, "failover-container-started")
 
 	// Step 3: Update state — user is running but degraded (only 1 copy)
 	coord.store.SetBipodRole(userID, survivingBipod.MachineID, "primary")
 	coord.store.SetUserPrimary(userID, survivingBipod.MachineID)
 	coord.store.SetUserStatus(userID, "running_degraded", "primary failed over from "+deadMachineID)
+	coord.store.CompleteOperation(opID)
 
 	coord.store.RecordFailoverEvent(FailoverEvent{
 		UserID:      userID,

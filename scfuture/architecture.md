@@ -1,8 +1,8 @@
 # scfuture — Architecture Document
 
-**Layer:** 4.5 — Suspension, Reactivation & Deletion Lifecycle
-**Module:** `scfuture` (Go 1.22, standard library only, no external dependencies)
-**Status:** 63/63 (Layer 4.5), 91/91 (Layer 4.4), 62/62 (Layer 4.3), 55/55 (Layer 4.2), 66/66 (Layer 4.1)
+**Layer:** 4.6 — Crash Recovery, Reconciliation & Postgres Migration
+**Module:** `scfuture` (Go 1.22, one external dependency: `github.com/lib/pq`)
+**Status:** 67/67 (Layer 4.6), 63/63 (Layer 4.5), 91/91 (Layer 4.4), 62/62 (Layer 4.3), 55/55 (Layer 4.2), 66/66 (Layer 4.1)
 **Last updated:** 2026-03-01
 
 ---
@@ -22,14 +22,19 @@ Each user gets:
 
 The coordinator drives provisioning by calling machine agent HTTP APIs. Machine agents self-register with the coordinator and send heartbeats every 10 seconds. The coordinator runs a health checker that detects machine failures and automatically fails over affected users. A reformer goroutine restores 2-copy replication after failover by provisioning new secondaries, and cleans up stale resources on machines that return from the dead. A retention enforcer goroutine manages the lifecycle of suspended users — automatically disconnecting DRBD after a warm retention period and evicting users (deleting fleet resources, keeping B2 backups) after an eviction period. Users can be suspended (containers stopped, data backed up to Backblaze B2), reactivated via warm path (images still on fleet) or cold path (restored from B2), and evicted (all fleet resources deleted).
 
+All coordinator state is persisted to **Supabase Postgres** (via pgbouncer connection pooler). An in-memory cache (populated from Postgres on startup) provides fast reads. Every mutation writes through to Postgres first, then updates the cache. On startup, the coordinator acquires a **Postgres advisory lock** for singleton enforcement, runs a **five-phase reconciliation** algorithm to recover from crashes, then starts background goroutines and the HTTP server. All multi-step operations are tracked in an **operations table** with step-by-step progress, enabling the reconciler to resume or safely roll back interrupted work. A **fault injection** system (`FAIL_AT` deterministic crash, `CHAOS_MODE` random 5% crash) enables comprehensive crash recovery testing.
+
 ### Key Design Decisions
 
 - **Device-mount pattern:** Containers receive the raw `/dev/drbdN` device and mount Btrfs internally. The host never mounts the user's filesystem, eliminating host-path leakage in `/proc/mounts`.
 - **Idempotent API:** Every endpoint returns success if the desired state already exists (`already_existed`, `already_formatted`). No endpoint fails on repeated calls.
 - **Per-user locking:** Concurrent requests for different users proceed in parallel. Requests for the same user are serialized via `sync.Mutex` per user ID.
 - **State discovery on startup (machine agent):** Rebuilds in-memory state from system reality (losetup, DRBD configs, DRBD status, mount table, Docker).
-- **In-memory state with JSON persistence (coordinator):** All coordinator state lives in `sync.RWMutex`-protected maps. Persisted to `state.json` for debugging, not crash recovery.
-- **Standard library only:** No external Go dependencies. No `go.sum` file.
+- **Postgres-backed state with in-memory cache (coordinator):** All coordinator state is persisted to Supabase Postgres. An in-memory cache provides fast reads; every write goes to Postgres first. The cache is loaded from Postgres on startup via `loadCache()` and can be refreshed via `ReloadCache()`.
+- **Advisory lock singleton:** `pg_try_advisory_lock(12345)` ensures only one coordinator instance is active. Stale locks from crashed pgbouncer sessions are cleared via `pg_terminate_backend()`.
+- **Operation tracking for crash recovery:** Every multi-step operation (provision, failover, reformation, suspension, reactivation, eviction) creates a row in the `operations` table. `coord.step(opID, stepName)` records progress and checks for fault injection. The reconciler reads incomplete operations on startup and resumes or rolls back each one.
+- **Five-phase startup reconciliation:** Phase 1 probes machines, Phase 2 reconciles DB with reality, Phase 3 resumes interrupted operations, Phase 3b cleans orphans, Phase 4 handles offline machines.
+- **Graceful shutdown:** SIGTERM/SIGINT triggers `context.Cancel()` to stop background goroutines, then `server.Shutdown()` for in-flight requests, then `store.Close()` for DB connection.
 - **Balanced placement:** Coordinator selects the 2 least-loaded active machines, excluding any above 85% disk usage.
 
 ---
@@ -38,7 +43,8 @@ The coordinator drives provisioning by calling machine agent HTTP APIs. Machine 
 
 ```
 scfuture/
-├── go.mod                                 # module scfuture, go 1.22
+├── go.mod                                 # module scfuture, go 1.22 (requires github.com/lib/pq)
+├── go.sum                                 # dependency checksums
 ├── Makefile                               # build (linux/amd64) both binaries
 ├── .gitignore                             # bin/, scripts/.ips
 ├── architecture.md                        # this file
@@ -65,8 +71,9 @@ scfuture/
 │   │   ├── exec.go                        # command execution helper
 │   │   └── heartbeat.go                   # coordinator registration + heartbeat loop
 │   └── coordinator/
-│       ├── server.go                      # HTTP routing, handlers, Coordinator struct
-│       ├── store.go                       # in-memory state store (machines, users, bipods, events)
+│       ├── server.go                      # HTTP routing, handlers, Coordinator struct, fault injection
+│       ├── store.go                       # Postgres-backed state store (machines, users, bipods, operations, events)
+│       ├── reconciler.go                  # five-phase startup reconciliation + operation resume handlers
 │       ├── fleet.go                       # fleet register/heartbeat handling
 │       ├── provisioner.go                 # 8-step provisioning state machine
 │       ├── machineapi.go                  # HTTP client for calling machine agents
@@ -102,7 +109,12 @@ scfuture/
     │   └── cloud-init/
     │       ├── coordinator.yaml
     │       └── fleet.yaml
-    └── layer-4.5/                         # Layer 4.5 test infrastructure (1 coord + 3 fleet + B2)
+    ├── layer-4.5/                         # Layer 4.5 test infrastructure (1 coord + 3 fleet + B2)
+    │   ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
+    │   └── cloud-init/
+    │       ├── coordinator.yaml
+    │       └── fleet.yaml
+    └── layer-4.6/                         # Layer 4.6 test infrastructure (1 coord + 3 fleet + B2 + Supabase Postgres)
         ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
         └── cloud-init/
             ├── coordinator.yaml
@@ -186,14 +198,27 @@ LifecycleEventResponse   { UserID, Type string; Success bool; Error string; Dura
 
 ```go
 type Coordinator struct {
-    store        *Store
-    B2BucketName string    // Layer 4.5
+    store            *Store
+    B2BucketName     string
+    failAt           string             // Layer 4.6 — deterministic fault injection checkpoint
+    chaosMode        bool               // Layer 4.6 — random crash mode
+    chaosProbability float64            // Layer 4.6 — crash probability (default 0.05)
+    cancelFunc       context.CancelFunc // Layer 4.6 — for graceful shutdown
 }
 
-func NewCoordinator(dataDir string, b2BucketName string) *Coordinator
+func NewCoordinator(databaseURL, b2BucketName string) (*Coordinator, error) // Layer 4.6 — takes databaseURL instead of dataDir
 func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux)
 func (coord *Coordinator) GetStore() *Store
+func (coord *Coordinator) SetCancelFunc(cancel context.CancelFunc)          // Layer 4.6
+func (coord *Coordinator) Reconcile()                                       // Layer 4.6 — five-phase startup reconciliation
+func (coord *Coordinator) step(opID, stepName string)                       // Layer 4.6 — record step + check fault injection
+func (coord *Coordinator) checkFault(name string)                           // Layer 4.6 — deterministic + chaos crash
 ```
+
+**Fault injection** (`FAIL_AT` and `CHAOS_MODE` env vars):
+- `coord.step(opID, stepName)` — writes `current_step` to the operations table, then calls `checkFault`
+- `checkFault(name)` — if `FAIL_AT == name`, calls `os.Exit(1)`. If `CHAOS_MODE` is true, crashes with 5% probability (`CHAOS_PROBABILITY` env var overrides).
+- Used by provisioner, lifecycle, reformer, and healthcheck to instrument every multi-step operation.
 
 **Routes (14):**
 
@@ -222,16 +247,41 @@ Lifecycle handlers (`handleSuspendUser`, `handleReactivateUser`, `handleEvictUse
 
 ```go
 type Store struct {
-    mu                sync.RWMutex
-    machines          map[string]*Machine
-    users             map[string]*User
-    bipods            map[string]*Bipod     // keyed by "{userID}:{machineID}"
-    nextPort          int                   // starts at 7900
-    nextMinor         map[string]int        // per-machine, starts at 0
-    failoverEvents    []FailoverEvent
-    reformationEvents []ReformationEvent    // Layer 4.4
-    lifecycleEvents   []LifecycleEvent      // Layer 4.5
-    dataDir           string
+    db       *sql.DB         // Layer 4.6 — Postgres connection (via github.com/lib/pq)
+    mu       sync.RWMutex
+    machines map[string]*Machine    // in-memory cache
+    users    map[string]*User       // in-memory cache
+    bipods   map[string]*Bipod      // keyed by "{userID}:{machineID}", in-memory cache
+}
+
+func NewStore(databaseURL string) (*Store, error) // Layer 4.6 — connects to Postgres, runs migrate(), loads cache
+```
+
+**Postgres schema** (auto-migrated via `CREATE TABLE IF NOT EXISTS`):
+- `machines` — machine_id PK, address, status, disk/RAM metrics, last_heartbeat
+- `users` — user_id PK, status, primary_machine, drbd_port UNIQUE, backup fields, drbd_disconnected
+- `bipods` — (user_id, machine_id) PK, role, drbd_minor, loop_device; FK to users ON DELETE CASCADE
+- `operations` — operation_id PK, type, user_id FK, status, current_step, metadata JSONB, timestamps, error
+- `events` — event_id SERIAL PK, timestamp, event_type, machine_id, user_id, operation_id, details JSONB
+- Indexes: bipods(machine_id), bipods(user_id), operations(status), operations(user_id), events(event_type), events(timestamp)
+
+**Connection pool:** MaxOpenConns=10, MaxIdleConns=5, ConnMaxLifetime=5min.
+
+**Write-through pattern:** Every mutation writes to Postgres first, then updates the in-memory cache. Read methods read from cache only (under `RLock`).
+
+**Operation tracking** (new for Layer 4.6):
+```go
+type Operation struct {
+    OperationID string
+    Type        string    // "provision", "failover", "reformation", "suspension",
+                          // "reactivation_warm", "reactivation_cold", "eviction"
+    UserID      string
+    Status      string    // "in_progress", "complete", "failed", "cancelled"
+    CurrentStep string    // last recorded step (e.g., "provision-drbd-created")
+    Metadata    map[string]interface{}  // operation-specific data (JSONB)
+    StartedAt   time.Time
+    CompletedAt *time.Time
+    Error       string
 }
 ```
 
@@ -310,75 +360,79 @@ type LifecycleEvent struct {
 }
 ```
 
-**StaleBipod (Layer 4.4):**
-```go
-type StaleBipod struct {
-    UserID, MachineID string
-}
-```
-
 **Key methods:**
 ```go
-// Existing (Layer 4.2)
-func NewStore(dataDir string) *Store
-func (s *Store) RegisterMachine(req *shared.FleetRegisterRequest)
-func (s *Store) UpdateHeartbeat(req *shared.FleetHeartbeatRequest)    // now handles resurrection
+// Machine methods (write to Postgres, update cache)
+func (s *Store) RegisterMachine(req *shared.FleetRegisterRequest)     // UPSERT via ON CONFLICT
+func (s *Store) UpdateHeartbeat(req *shared.FleetHeartbeatRequest)    // handles resurrection
 func (s *Store) GetMachine(id string) *Machine
 func (s *Store) AllMachines() []*Machine
+func (s *Store) SetMachineStatus(machineID, status string)
+func (s *Store) CheckMachineHealth(suspectThreshold, deadThreshold time.Duration) []string
+
+// User methods
 func (s *Store) CreateUser(userID string, imageSizeMB int) (*User, error)
 func (s *Store) GetUser(userID string) *User
 func (s *Store) AllUsers() []*User
 func (s *Store) SetUserStatus(userID, status, errMsg string)
 func (s *Store) SetUserPrimary(userID, machineID string)
 func (s *Store) SetUserPort(userID string, port int)
-func (s *Store) CreateBipod(userID, machineID, role string, minor int)
-func (s *Store) SetBipodLoopDevice(userID, machineID, loopDev string)
-func (s *Store) GetBipods(userID string) []*Bipod
-func (s *Store) AllocatePort() int
-func (s *Store) AllocateMinor(machineID string) int
-func (s *Store) SelectMachines() (primary, secondary *Machine, err error)
-
-// New (Layer 4.3)
-func (s *Store) CheckMachineHealth(suspectThreshold, deadThreshold time.Duration) []string
+func (s *Store) SetUserBackup(userID, b2Path, bucketName string)
+func (s *Store) SetUserDRBDDisconnected(userID string, disconnected bool)
 func (s *Store) GetUsersOnMachine(machineID string) []string
 func (s *Store) GetSurvivingBipod(userID, deadMachineID string) *Bipod
+func (s *Store) GetDegradedUsers(stabilizationPeriod time.Duration) []*User
+func (s *Store) GetSuspendedUsers() []*User
+
+// Bipod methods
+func (s *Store) CreateBipod(userID, machineID, role string, minor int)  // UPSERT
+func (s *Store) SetBipodLoopDevice(userID, machineID, loopDev string)
 func (s *Store) SetBipodRole(userID, machineID, role string)
+func (s *Store) GetBipods(userID string) []*Bipod
+func (s *Store) RemoveBipod(userID, machineID string)
+func (s *Store) ClearUserBipods(userID string)                // DELETE FROM bipods + clear primary_machine
+func (s *Store) GetStaleBipodsOnActiveMachines(userID string) []*Bipod
+func (s *Store) GetAllStaleBipodsOnActiveMachines() []*Bipod
+
+// Port and minor allocation (derived from DB)
+func (s *Store) AllocatePort() int                           // SELECT MAX(drbd_port) + 1
+func (s *Store) AllocateMinor(machineID string) int          // SELECT MAX(drbd_minor) + 1 per machine
+func (s *Store) SelectMachines() (primary, secondary *Machine, err error)
+func (s *Store) SelectOneSecondary(excludeIDs []string) (*Machine, error)
+
+// Operation tracking (Layer 4.6)
+func (s *Store) CreateOperation(opID, opType, userID string, metadata map[string]interface{}) error
+func (s *Store) UpdateOperationStep(opID, step string)
+func (s *Store) CompleteOperation(opID string)
+func (s *Store) FailOperation(opID, errMsg string)
+func (s *Store) CancelOperation(opID string)
+func (s *Store) GetIncompleteOperations() ([]*Operation, error) // WHERE status IN ('in_progress', 'pending')
+
+// Event recording (unified events table, Layer 4.6)
+func (s *Store) RecordEvent(eventType, machineID, userID, operationID string, details map[string]interface{})
 func (s *Store) RecordFailoverEvent(event FailoverEvent)
 func (s *Store) GetFailoverEvents() []FailoverEvent
-
-// New (Layer 4.4)
-func (s *Store) GetDegradedUsers(stabilizationPeriod time.Duration) []*User
-func (s *Store) GetStaleBipodsOnActiveMachines(userID string) []StaleBipod
-func (s *Store) GetAllStaleBipodsOnActiveMachines() []StaleBipod
-func (s *Store) RemoveBipod(userID, machineID string)
-func (s *Store) SelectOneSecondary(excludeIDs []string) (*Machine, error)
 func (s *Store) RecordReformationEvent(event ReformationEvent)
 func (s *Store) GetReformationEvents() []ReformationEvent
-
-// New (Layer 4.5)
-func (s *Store) SetUserBackup(userID string, exists bool, path, bucket string)
-func (s *Store) SetUserDRBDDisconnected(userID string, disconnected bool)
-func (s *Store) ClearUserBipods(userID string)
-func (s *Store) GetSuspendedUsers() []*User
 func (s *Store) RecordLifecycleEvent(event LifecycleEvent)
 func (s *Store) GetLifecycleEvents() []LifecycleEvent
+
+// Postgres-specific (Layer 4.6)
+func (s *Store) AcquireAdvisoryLock() error       // pg_try_advisory_lock(12345) with stale session recovery
+func (s *Store) ReloadCache() error               // re-populates in-memory maps from Postgres
+func (s *Store) Close() error                     // closes DB connection
+func (s *Store) DB() *sql.DB                      // direct DB access for reconciliation
 ```
+
+`AcquireAdvisoryLock` tries `pg_try_advisory_lock(12345)`. If the lock is held (stale session from a crashed coordinator behind pgbouncer), it finds the holding PID via `pg_locks`, calls `pg_terminate_backend()` to kill the stale backend, and retries for up to 30 seconds.
 
 `SelectMachines` holds the write lock, filters active machines with <85% disk usage, sorts by `ActiveAgents` ascending, increments `ActiveAgents` on the selected pair to prevent double-placement.
 
 `CheckMachineHealth` scans all machines, compares `time.Since(LastHeartbeat)` against thresholds, transitions statuses, returns list of machine IDs that just became `"dead"`.
 
-`UpdateHeartbeat` now handles **resurrection**: if a heartbeat arrives from a `"dead"` or `"suspect"` machine, resets status to `"active"`. Stale bipod cleanup happens asynchronously via the reformer.
+`UpdateHeartbeat` handles **resurrection**: if a heartbeat arrives from a `"dead"` or `"suspect"` machine, resets status to `"active"`. Stale bipod cleanup happens asynchronously via the reformer.
 
-`GetSurvivingBipod` returns the bipod NOT on the dead machine, skipping bipods with role `"stale"`.
-
-`GetDegradedUsers` returns users in `"running_degraded"` state whose `StatusChangedAt` is older than the stabilization period (prevents thrashing during cascading failures).
-
-`GetAllStaleBipodsOnActiveMachines` returns all bipods with role `"stale"` on machines that are currently `"active"` — used by the reformer's cleanup pass to clean up resources on machines that have returned from the dead.
-
-`SelectOneSecondary` is like `SelectMachines` but picks a single least-loaded active machine, excluding specified machine IDs (the current primary).
-
-**Persistence:** `persist()` writes all state (including failover, reformation, and lifecycle events) as JSON to `{dataDir}/state.json` after every mutation. This is for debugging only — the coordinator does NOT reload from state.json on restart.
+`AllocatePort` and `AllocateMinor` derive next values from `SELECT MAX(...)` queries against Postgres, replacing the old in-memory counters.
 
 ### 4.3 Fleet Handling (`fleet.go`)
 
@@ -395,7 +449,7 @@ Thin wrappers that delegate to `store.RegisterMachine` and `store.UpdateHeartbea
 func (coord *Coordinator) ProvisionUser(userID string)
 ```
 
-Runs in its own goroutine (launched by `handleProvisionUser`). Drives the full provisioning state machine:
+Runs in its own goroutine (launched by `handleProvisionUser`). Creates an operation row (`CreateOperation`) and drives the full provisioning state machine. Each step calls `coord.step(opID, stepName)` to record progress and check fault injection:
 
 ```
 Step 1: SelectMachines() → pick 2 least-loaded
@@ -405,10 +459,10 @@ Step 4: DRBDPromote on primary (MUST happen before sync)
 Step 5: Wait for DRBD sync (poll DRBDStatus until PeerDiskState=UpToDate, 120s timeout)
 Step 6: FormatBtrfs on primary (retry once)
 Step 7: ContainerStart on primary (retry once)
-Step 8: SetUserStatus → "running"
+Step 8: SetUserStatus → "running", CompleteOperation
 ```
 
-Each step uses a `retry` helper that retries once after 2s on failure. On failure after retry, sets user status to `"failed"` with error message.
+Each step uses a `retry` helper that retries once after 2s on failure. On failure after retry, sets user status to `"failed"` with error message and calls `FailOperation`.
 
 Helper: `stripPort(address string) string` — extracts IP from `"10.0.0.11:8080"` for DRBD config addresses.
 
@@ -602,6 +656,60 @@ func (coord *Coordinator) disconnectSuspendedDRBD(userID string)
 2. Set `DRBDDisconnected = true` in store
 3. Record lifecycle event (`drbd_disconnect`)
 
+### 4.10 Reconciler (`reconciler.go`) — Layer 4.6
+
+```go
+func (coord *Coordinator) Reconcile()
+
+// Internal types
+type machineReality struct { Online bool; MachineID, Address string; Users map[string]machineUserInfo }
+type machineUserInfo struct { ImageExists bool; DRBDRole string; ContainerRunning bool }
+type orphanEntry struct { MachineID, UserID, Address string }
+
+// Phase functions
+func (coord *Coordinator) reconcilePhase1DiscoverReality(logger) map[string]*machineReality
+func (coord *Coordinator) reconcilePhase2ReconcileDB(logger, machineStatuses) []orphanEntry
+func (coord *Coordinator) reconcilePhase3ResumeOperations(logger, machineStatuses) int
+func (coord *Coordinator) reconcilePhase3bCleanOrphans(logger, orphans)
+func (coord *Coordinator) reconcilePhase4HandleOffline(logger)
+
+// Operation resume handlers
+func (coord *Coordinator) resumeProvision(op, machineStatuses)
+func (coord *Coordinator) resumeFailover(op, machineStatuses)
+func (coord *Coordinator) resumeReformation(op, machineStatuses)
+func (coord *Coordinator) resumeSuspension(op, machineStatuses)
+func (coord *Coordinator) resumeWarmReactivation(op, machineStatuses)
+func (coord *Coordinator) resumeColdReactivation(op, machineStatuses)
+func (coord *Coordinator) resumeEviction(op, machineStatuses)
+```
+
+Called **before** starting background goroutines or HTTP server. Five phases:
+
+**Phase 1 — Discover Reality:** Probes all machines in the DB via their `/status` endpoint (5s timeout). Online machines get status `"active"`, unreachable machines get status `"dead"`. Collects per-machine user inventory (image exists, DRBD role, container running). Calls `ReloadCache()` after status updates.
+
+**Phase 2 — Reconcile DB:** Cross-references machine reality with DB state:
+- Bipods on dead/unreachable machines → marked `"stale"`
+- Bipods where machine is online but doesn't know the user → marked as orphans (or stale if the user is `"running"`)
+- Running users with 0 live bipods → marked `"failed"` (resources lost during crash)
+- Running users with bipods but no running container → logged as warning (Phase 3/4 will repair)
+- Provisioning users with a running container → updated to `"running"` (coordinator crashed after start but before status update)
+- Evicted users with non-stale bipods → cleaned up (crashed reactivation leftovers)
+- Machine has user resources that DB doesn't know → added to orphans list
+
+**Phase 3 — Resume Operations:** Reads `operations` table for `status IN ('in_progress', 'pending')`. Per-type resume handlers:
+- `resumeProvision` — if container already running, complete it; otherwise mark user `"failed"` for re-provision
+- `resumeFailover` — uses `switch op.CurrentStep` with `fallthrough` to resume from the exact step (promote → container start → complete)
+- `resumeReformation` — reverts to `"running_degraded"` (reformer will retry)
+- `resumeSuspension` — if container stopped and past demote step, complete; otherwise revert to previous status
+- `resumeWarmReactivation` — if container running, complete; otherwise revert to `"suspended"`
+- `resumeColdReactivation` — if container running, complete; otherwise clean partial resources and revert to `"evicted"`
+- `resumeEviction` — uses `switch op.CurrentStep`: if resources cleaned, complete; if backup verified, re-clean resources; otherwise revert to `"suspended"`
+- Also catches users stuck in `"provisioning"` with no operation row → marks `"failed"`
+
+**Phase 3b — Clean Orphans:** For each orphan from Phase 2, calls `DeleteUser` on the machine and `RemoveBipod` in store.
+
+**Phase 4 — Handle Offline:** For each machine with status `"dead"`, finds users in `"running"` or `"running_degraded"` and triggers `failoverUser`.
+
 ---
 
 ## 5. Package: `internal/machineagent` — Machine Agent
@@ -793,12 +901,14 @@ Runs in a goroutine. Registers with coordinator (retries every 5s until success)
 ### `cmd/coordinator/main.go`
 
 1. JSON structured logging
-2. Reads env: `LISTEN_ADDR` (default `0.0.0.0:8080`), `DATA_DIR` (default `/data`), `B2_BUCKET_NAME`
-3. Creates `Coordinator` via `NewCoordinator(dataDir, b2BucketName)`
-4. Starts health checker goroutine via `StartHealthChecker(coord.GetStore(), ...)`
-5. Starts reformer goroutine via `StartReformer(coord.GetStore(), coord)`
-6. Starts retention enforcer goroutine via `StartRetentionEnforcer(coord.GetStore(), coord)`
-7. Registers routes, starts `http.ListenAndServe`
+2. Reads env: `LISTEN_ADDR` (default `0.0.0.0:8080`), `DATABASE_URL` (required), `B2_BUCKET_NAME`
+3. Creates `Coordinator` via `NewCoordinator(databaseURL, b2BucketName)` — connects to Postgres, runs schema migration, loads cache
+4. Acquires advisory lock via `coord.GetStore().AcquireAdvisoryLock()` — singleton enforcement
+5. Runs reconciliation via `coord.Reconcile()` — five-phase crash recovery (BEFORE goroutines/HTTP)
+6. Creates `context.WithCancel`, calls `coord.SetCancelFunc(cancel)`
+7. Starts health checker, reformer, and retention enforcer goroutines
+8. Registers routes, starts HTTP server
+9. Graceful shutdown: SIGTERM/SIGINT → `cancel()` → `server.Shutdown(10s timeout)` → `store.Close()`
 
 ### `cmd/machine-agent/main.go`
 
@@ -821,28 +931,30 @@ Runs in a goroutine. Registers with coordinator (retries every 5s until success)
 
 ## 8. Infrastructure & Deployment
 
-### Layer 4.5 Topology
+### Layer 4.6 Topology
 
-- 1x coordinator (`l45-coordinator`, private `10.0.0.2`)
-- 3x fleet machines (`l45-fleet-{1,2,3}`, private IPs auto-assigned)
+- 1x coordinator (`l46-coordinator`, private `10.0.0.2`)
+- 3x fleet machines (`l46-fleet-{1,2,3}`, private IPs auto-assigned)
 - All Hetzner Cloud `cx23`, Ubuntu 24.04, private network `10.0.0.0/24`
 - 1x Backblaze B2 bucket (created/destroyed per test run by `run.sh`)
-- Same base topology as Layers 4.2–4.4 (with `l45-` prefix)
+- 1x Supabase Postgres database (external, `DATABASE_URL` via pgbouncer port 6543)
+- Same base topology as Layers 4.2–4.5 (with `l46-` prefix)
 
-### Deployment Flow (`scripts/layer-4.5/deploy.sh`)
+### Deployment Flow (`scripts/layer-4.6/deploy.sh`)
 
 **Coordinator:**
 1. Wait for SSH + cloud-init
 2. `scp` coordinator binary to `/usr/local/bin/coordinator`
-3. Set hostname, `systemctl enable --now coordinator`
+3. Configure systemd override with `DATABASE_URL`, `B2_BUCKET_NAME`, retention timers
+4. Set hostname, `systemctl enable --now coordinator`
 
 **Fleet machines (each):**
 1. Wait for SSH + cloud-init
 2. `scp` machine-agent binary + container files
-3. Set hostname, configure systemd with `NODE_ID`, `NODE_ADDRESS`, `COORDINATOR_URL`
-4. Build `platform/app-container` image, verify DRBD module, `systemctl enable --now machine-agent`
+3. Set hostname, configure systemd with `NODE_ID`, `NODE_ADDRESS`, `COORDINATOR_URL`, B2 credentials
+4. Build `platform/app-container` image, verify DRBD module (with SSH retry), `systemctl enable --now machine-agent` (with SSH retry)
 
-Note: `enable --now` (not just `start`) ensures services auto-restart on reboot — critical for the dead machine return test.
+Note: `enable --now` (not just `start`) ensures services auto-restart on reboot — critical for crash recovery tests. SSH retry loops handle transient connection drops after heavy operations (e.g., docker build).
 
 ### Systemd Units
 
@@ -850,10 +962,14 @@ Note: `enable --now` (not just `start`) ensures services auto-restart on reboot 
 ```ini
 ExecStart=/usr/local/bin/coordinator
 Environment=LISTEN_ADDR=0.0.0.0:8080
-Environment=DATA_DIR=/data
+Environment=DATABASE_URL={supabase-connection-string}   # via pgbouncer port 6543
 Environment=B2_BUCKET_NAME={bucket-name}
-Environment=WARM_RETENTION_SECONDS=15       # test value (production: 604800 = 7 days)
-Environment=EVICTION_SECONDS=30             # test value (production: 2592000 = 30 days)
+Environment=WARM_RETENTION_SECONDS=600      # test value (production: 604800 = 7 days)
+Environment=EVICTION_SECONDS=1200           # test value (production: 2592000 = 30 days)
+# Optional fault injection:
+# Environment=FAIL_AT={step-name}           # deterministic crash at specific step
+# Environment=CHAOS_MODE=true               # random 5% crash at every step
+# Environment=CHAOS_PROBABILITY=0.05        # override crash probability
 ```
 
 **Machine Agent:**
@@ -882,8 +998,8 @@ Environment=B2_BUCKET_NAME={bucket-name}
 ### Storage Layout (coordinator)
 
 ```
-/data/state.json                   # JSON state dump (debug only)
 /usr/local/bin/coordinator         # coordinator binary
+# All state in Supabase Postgres (no local data directory)
 ```
 
 ---
@@ -1106,6 +1222,46 @@ Tests full user lifecycle: suspend, warm reactivate, evict, cold reactivate, ret
 | 9 | 6 | Coordinator state consistency (final state correct, backups exist, events recorded) |
 | 10 | 6 | Cleanup all fleet machines |
 
+### Layer 4.6 — Crash Recovery, Reconciliation & Postgres (67 checks, 12 phases)
+
+Tests coordinator crash recovery via deterministic fault injection (`FAIL_AT`) and random chaos mode (`CHAOS_MODE`). 4 Hetzner servers (1 coord + 3 fleet) + 1 Backblaze B2 bucket + 1 Supabase Postgres database. Retention timers set high (600s/1200s) to prevent interference with crash tests.
+
+| Phase | Checks | What |
+|-------|--------|------|
+| 0 | 16 | Prerequisites (coordinator, 3 machines, Postgres, DRBD, images, B2, no events) |
+| 1 | 6 | Provision 2 users, write test data, verify DRBD healthy |
+| 2 | 5 | Suspend user-17, verify B2 backup + DRBD demoted |
+| 3 | 5 | Warm reactivation of user-17, data intact, DRBD Primary |
+| 4 | 5 | Deterministic crash tests — provision, failover, suspension (FAIL_AT injection) |
+| 5 | 4 | Deterministic crash tests — warm/cold reactivation, eviction (FAIL_AT injection) |
+| 6 | 6 | Multi-user provision (6 users) with consistency check |
+| 7 | 9 | Chaos mode stress test (CHAOS_MODE=true, 5% random crash, repeated crash+recover cycles) |
+| 8 | 6 | Machine failure + failover with consistency check during chaos |
+| 9 | 4 | Extended chaos mode with all operation types (suspend, reactivate, evict under chaos) |
+| 10 | 3 | Final recovery — clean coordinator restart, reconciliation, consistency check |
+| 11 | 3 | Final consistency + cleanup (all invariants hold, B2 bucket cleaned, DB cleaned) |
+
+**12 system invariants** checked by `check_consistency`:
+1. Every running user has ≥1 container
+2. Every running user has ≥1 non-stale bipod
+3. No user in transitional state (provisioning, suspending, reactivating, etc.)
+4. No user in failing_over state
+5. No user in reforming state
+6. Every non-stale bipod references an active machine
+7. Every suspended user has a B2 backup
+8. No incomplete operations in the operations table
+9. All machines are active
+10. Every evicted user has 0 non-stale bipods
+11. Every running user has exactly 2 non-stale bipods
+12. No duplicate DRBD ports
+
+**`crash_test` helper** — injects a deterministic crash and verifies recovery:
+1. Set `FAIL_AT={step}` via systemd override
+2. Trigger the operation (provision, suspend, etc.) — coordinator crashes at the specified step
+3. Remove fault config, restart coordinator (with SSH retry resilience)
+4. Wait for coordinator ready + reconciliation to complete
+5. Run `check_consistency` to verify all invariants hold
+
 ### Test Helpers (`common.sh`)
 
 ```bash
@@ -1120,6 +1276,11 @@ wait_for_user_status_multi user_id s1 s2 timeout # poll until user reaches eithe
 wait_for_user_bipod_count user_id count timeout  # poll until user has N non-stale bipods
 get_public_ip machine_id                         # map fleet-N → public IP
 phase_start/phase_result/final_result            # test framework
+
+# Layer 4.6 additions
+crash_test step_name operation_type trigger_cmd   # fault injection + recovery + consistency check
+check_consistency label                           # verify all 12 system invariants
+wait_for_coordinator timeout                      # poll coordinator /api/fleet until responsive
 ```
 
 ---
@@ -1150,7 +1311,15 @@ phase_start/phase_result/final_result            # test framework
 - **Reformation has a 30s stabilization period** — prevents thrashing during cascading failures
 - **Internal states must not leak to users** — `running_degraded`, `failing_over`, `reforming` are operational; user-facing APIs must map them to `running`
 - **B2 backup safety rule** — never evict the last fleet copy until B2 backup is verified to exist
-- **Retention enforcer is configurable** — `WARM_RETENTION_SECONDS` and `EVICTION_SECONDS` env vars (test: 15s/30s, production: 7 days/30 days)
+- **Retention enforcer is configurable** — `WARM_RETENTION_SECONDS` and `EVICTION_SECONDS` env vars (test: 600s/1200s, production: 7 days/30 days)
 - **Suspended users skip failover** — healthcheck marks bipods stale but takes no DRBD/container actions
 - **Cold restore uses bare Btrfs format** — no seed data, workspace is created from received B2 snapshot
 - **b2 CLI requires explicit authorization** — `b2 account authorize` must be called before every b2 file operation
+- **Postgres write-through** — every store mutation writes to Postgres first, then updates in-memory cache
+- **Advisory lock singleton** — `pg_try_advisory_lock(12345)` prevents multiple coordinators; stale pgbouncer sessions are terminated
+- **Operation tracking** — every multi-step operation creates a row in `operations` table; `coord.step()` records progress for crash recovery
+- **Reconciliation runs before HTTP server** — ensures system consistency before accepting requests
+- **Fault injection** — `FAIL_AT` for deterministic crash at named step, `CHAOS_MODE` for random 5% crash probability
+- **Graceful shutdown** — SIGTERM → cancel context → shutdown HTTP → close DB
+- **One external dependency** — `github.com/lib/pq` for Postgres driver (imported as `_ "github.com/lib/pq"`)
+- **Supabase Postgres via pgbouncer** — connection string uses port 6543 (transaction pooler), not direct Postgres port

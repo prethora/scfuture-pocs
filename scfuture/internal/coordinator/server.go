@@ -1,23 +1,53 @@
 package coordinator
 
 import (
+	"context"
+	"crypto/rand"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"math"
+	mathrand "math/rand"
 	"net/http"
+	"os"
+	"strconv"
+	"time"
 
 	"scfuture/internal/shared"
 )
 
 type Coordinator struct {
-	store        *Store
-	B2BucketName string
+	store            *Store
+	B2BucketName     string
+	failAt           string
+	chaosMode        bool
+	chaosProbability float64
+	cancelFunc       context.CancelFunc // for graceful shutdown
 }
 
-func NewCoordinator(dataDir string, b2BucketName string) *Coordinator {
-	return &Coordinator{
-		store:        NewStore(dataDir),
-		B2BucketName: b2BucketName,
+func NewCoordinator(databaseURL, b2BucketName string) (*Coordinator, error) {
+	store, err := NewStore(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("create store: %w", err)
 	}
+
+	failAt := os.Getenv("FAIL_AT")
+	chaosMode := os.Getenv("CHAOS_MODE") == "true"
+	chaosProbability := 0.05
+	if v := os.Getenv("CHAOS_PROBABILITY"); v != "" {
+		if p, err := strconv.ParseFloat(v, 64); err == nil {
+			chaosProbability = p
+		}
+	}
+
+	return &Coordinator{
+		store:            store,
+		B2BucketName:     b2BucketName,
+		failAt:           failAt,
+		chaosMode:        chaosMode,
+		chaosProbability: chaosProbability,
+	}, nil
 }
 
 func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
@@ -44,11 +74,74 @@ func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/users/{id}/reactivate", coord.handleReactivateUser)
 	mux.HandleFunc("POST /api/users/{id}/evict", coord.handleEvictUser)
 	mux.HandleFunc("GET /api/lifecycle-events", coord.handleGetLifecycleEvents)
+
+	// Events & Operations (Layer 4.6)
+	mux.HandleFunc("GET /api/events", coord.handleGetEvents)
+	mux.HandleFunc("GET /api/operations", coord.handleGetOperations)
 }
 
 func (coord *Coordinator) GetStore() *Store {
 	return coord.store
 }
+
+func (coord *Coordinator) SetCancelFunc(cancel context.CancelFunc) {
+	coord.cancelFunc = cancel
+}
+
+// ─── Fault injection ───
+
+func (coord *Coordinator) checkFault(name string) {
+	if coord.failAt == name {
+		slog.Warn("FAULT INJECTION: crashing at checkpoint", "checkpoint", name)
+		os.Exit(1)
+	}
+	if coord.chaosMode && mathrand.Float64() < coord.chaosProbability {
+		slog.Warn("CHAOS: random crash at checkpoint", "checkpoint", name)
+		os.Exit(1)
+	}
+}
+
+func (coord *Coordinator) step(opID, stepName string) {
+	coord.store.UpdateOperationStep(opID, stepName)
+	coord.checkFault(stepName)
+}
+
+// ─── Operation ID generation ───
+
+func generateOpID() string {
+	return fmt.Sprintf("op-%d-%s", time.Now().UnixNano(), randomSuffix(6))
+}
+
+func randomSuffix(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+// ─── Metadata helpers for operation resumption ───
+
+func metaString(meta map[string]interface{}, key string) string {
+	if v, ok := meta[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func metaInt(meta map[string]interface{}, key string) int {
+	if v, ok := meta[key]; ok {
+		switch n := v.(type) {
+		case float64:
+			return int(math.Round(n))
+		case int:
+			return n
+		}
+	}
+	return 0
+}
+
+// ─── Handlers ───
 
 func (coord *Coordinator) handleGetFailovers(w http.ResponseWriter, r *http.Request) {
 	events := coord.store.GetFailoverEvents()
@@ -268,6 +361,82 @@ func (coord *Coordinator) handleGetLifecycleEvents(w http.ResponseWriter, r *htt
 		events = []LifecycleEvent{}
 	}
 	writeJSON(w, http.StatusOK, events)
+}
+
+func (coord *Coordinator) handleGetEvents(w http.ResponseWriter, r *http.Request) {
+	rows, err := coord.store.DB().Query(`SELECT event_id, timestamp, event_type, machine_id, user_id, operation_id, details FROM events ORDER BY timestamp DESC LIMIT 100`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var events []map[string]interface{}
+	for rows.Next() {
+		var eventID int
+		var ts time.Time
+		var eventType string
+		var machineID, userID, operationID sql.NullString
+		var detailsJSON []byte
+		rows.Scan(&eventID, &ts, &eventType, &machineID, &userID, &operationID, &detailsJSON)
+
+		var details map[string]interface{}
+		json.Unmarshal(detailsJSON, &details)
+
+		events = append(events, map[string]interface{}{
+			"event_id":     eventID,
+			"timestamp":    ts,
+			"event_type":   eventType,
+			"machine_id":   machineID.String,
+			"user_id":      userID.String,
+			"operation_id": operationID.String,
+			"details":      details,
+		})
+	}
+	if events == nil {
+		events = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+func (coord *Coordinator) handleGetOperations(w http.ResponseWriter, r *http.Request) {
+	rows, err := coord.store.DB().Query(`SELECT operation_id, type, user_id, status, current_step, metadata, started_at, completed_at, error FROM operations ORDER BY started_at DESC LIMIT 100`)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var ops []map[string]interface{}
+	for rows.Next() {
+		var opID, opType, userID, status, currentStep, errStr string
+		var metaJSON []byte
+		var startedAt time.Time
+		var completedAt sql.NullTime
+		rows.Scan(&opID, &opType, &userID, &status, &currentStep, &metaJSON, &startedAt, &completedAt, &errStr)
+
+		var meta map[string]interface{}
+		json.Unmarshal(metaJSON, &meta)
+
+		entry := map[string]interface{}{
+			"operation_id": opID,
+			"type":         opType,
+			"user_id":      userID,
+			"status":       status,
+			"current_step": currentStep,
+			"metadata":     meta,
+			"started_at":   startedAt,
+			"error":        errStr,
+		}
+		if completedAt.Valid {
+			entry["completed_at"] = completedAt.Time
+		}
+		ops = append(ops, entry)
+	}
+	if ops == nil {
+		ops = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, ops)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

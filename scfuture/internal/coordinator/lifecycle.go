@@ -24,6 +24,12 @@ func (coord *Coordinator) suspendUser(userID string) {
 		return
 	}
 
+	opID := generateOpID()
+	coord.store.CreateOperation(opID, "suspension", userID, map[string]interface{}{
+		"primary_machine": user.PrimaryMachine,
+		"previous_status": user.Status,
+	})
+
 	coord.store.SetUserStatus(userID, "suspending", "")
 
 	// Find the primary machine
@@ -31,6 +37,7 @@ func (coord *Coordinator) suspendUser(userID string) {
 	if primaryMachine == nil {
 		logger.Error("Primary machine not found")
 		coord.store.SetUserStatus(userID, user.Status, "primary machine not found for suspension")
+		coord.store.FailOperation(opID, "primary machine not found")
 		return
 	}
 	primaryClient := NewMachineClient(primaryMachine.Address)
@@ -39,6 +46,7 @@ func (coord *Coordinator) suspendUser(userID string) {
 	if err := primaryClient.ContainerStop(userID); err != nil {
 		logger.Error("Container stop failed", "error", err)
 		coord.store.SetUserStatus(userID, user.Status, "container stop failed: "+err.Error())
+		coord.store.FailOperation(opID, "container stop: "+err.Error())
 		coord.store.RecordLifecycleEvent(LifecycleEvent{
 			UserID: userID, Type: "suspension", Success: false,
 			Error: "container stop: " + err.Error(),
@@ -47,17 +55,18 @@ func (coord *Coordinator) suspendUser(userID string) {
 		return
 	}
 	logger.Info("Container stopped")
+	coord.step(opID, "suspend-container-stopped")
 
 	// ── Step 2: Take final snapshot ──
 	snapName := fmt.Sprintf("suspend-%s", time.Now().UTC().Format("20060102T150405Z"))
 	_, err := primaryClient.Snapshot(userID, &shared.SnapshotRequest{SnapshotName: snapName})
 	if err != nil {
 		logger.Error("Snapshot failed", "error", err)
-		// Non-fatal for suspension — proceed but log warning
 		logger.Warn("Continuing suspension without snapshot")
 	} else {
 		logger.Info("Snapshot created", "name", snapName)
 	}
+	coord.step(opID, "suspend-snapshot-created")
 
 	// ── Step 3: Backup to B2 ──
 	backupSuccess := false
@@ -78,20 +87,21 @@ func (coord *Coordinator) suspendUser(userID string) {
 	} else {
 		logger.Warn("No B2 bucket configured — skipping backup")
 	}
+	coord.step(opID, "suspend-backed-up")
 
 	// ── Step 4: Demote primary to Secondary ──
-	// This is safe because the container is stopped and we don't need to write anymore
 	_, err = primaryClient.DRBDDemote(userID)
 	if err != nil {
-		// Non-fatal — DRBD may already be Secondary or StandAlone
 		logger.Warn("DRBD demote failed (non-fatal)", "error", err)
 	} else {
 		logger.Info("DRBD demoted to Secondary")
 	}
+	coord.step(opID, "suspend-demoted")
 
 	// ── Step 5: Set status → "suspended" ──
 	coord.store.SetUserStatus(userID, "suspended", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
+	coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "suspension", Success: true,
@@ -132,6 +142,12 @@ func (coord *Coordinator) warmReactivate(userID string) {
 		return
 	}
 
+	opID := generateOpID()
+	coord.store.CreateOperation(opID, "reactivation_warm", userID, map[string]interface{}{
+		"primary_machine": user.PrimaryMachine,
+		"drbd_disconnected": user.DRBDDisconnected,
+	})
+
 	coord.store.SetUserStatus(userID, "reactivating", "")
 
 	// Find bipods on active machines
@@ -149,6 +165,7 @@ func (coord *Coordinator) warmReactivate(userID string) {
 	if len(activeBipods) == 0 {
 		logger.Error("No active bipods found — cannot warm reactivate")
 		coord.store.SetUserStatus(userID, "suspended", "no active bipods for warm reactivation")
+		coord.store.FailOperation(opID, "no active bipods")
 		coord.store.RecordLifecycleEvent(LifecycleEvent{
 			UserID: userID, Type: "reactivation_warm", Success: false,
 			Error: "no active bipods",
@@ -157,7 +174,7 @@ func (coord *Coordinator) warmReactivate(userID string) {
 		return
 	}
 
-	// Pick primary — use the user's recorded primary if it has an active bipod, else pick first active
+	// Pick primary
 	var primaryBipod *Bipod
 	for _, b := range activeBipods {
 		if b.MachineID == user.PrimaryMachine {
@@ -185,14 +202,15 @@ func (coord *Coordinator) warmReactivate(userID string) {
 				}
 			}
 		}
-		// Wait briefly for resync
 		time.Sleep(3 * time.Second)
 	}
+	coord.step(opID, "reactivate-warm-connected")
 
 	// ── Step 2: Promote DRBD ──
 	if _, err := primaryClient.DRBDPromote(userID); err != nil {
 		logger.Error("DRBD promote failed", "error", err)
 		coord.store.SetUserStatus(userID, "suspended", "promote failed: "+err.Error())
+		coord.store.FailOperation(opID, "promote: "+err.Error())
 		coord.store.RecordLifecycleEvent(LifecycleEvent{
 			UserID: userID, Type: "reactivation_warm", Success: false,
 			Error: "promote: " + err.Error(),
@@ -201,11 +219,13 @@ func (coord *Coordinator) warmReactivate(userID string) {
 		return
 	}
 	logger.Info("DRBD promoted")
+	coord.step(opID, "reactivate-warm-promoted")
 
 	// ── Step 3: Start container ──
 	if _, err := primaryClient.ContainerStart(userID); err != nil {
 		logger.Error("Container start failed", "error", err)
 		coord.store.SetUserStatus(userID, "suspended", "container start failed: "+err.Error())
+		coord.store.FailOperation(opID, "container start: "+err.Error())
 		coord.store.RecordLifecycleEvent(LifecycleEvent{
 			UserID: userID, Type: "reactivation_warm", Success: false,
 			Error: "container start: " + err.Error(),
@@ -214,11 +234,13 @@ func (coord *Coordinator) warmReactivate(userID string) {
 		return
 	}
 	logger.Info("Container started")
+	coord.step(opID, "reactivate-warm-container-started")
 
 	// ── Step 4: Update state ──
 	coord.store.SetBipodRole(userID, primaryBipod.MachineID, "primary")
 	coord.store.SetUserStatus(userID, "running", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
+	coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "reactivation_warm", Success: true,
@@ -251,10 +273,11 @@ func (coord *Coordinator) coldReactivate(userID string) {
 	coord.store.SetUserStatus(userID, "reactivating", "")
 
 	// Helper to fail
-	fail := func(step string, err error) {
+	fail := func(opID, step string, err error) {
 		msg := fmt.Sprintf("%s: %v", step, err)
 		logger.Error("Cold reactivation failed", "step", step, "error", err)
 		coord.store.SetUserStatus(userID, "evicted", msg)
+		coord.store.FailOperation(opID, msg)
 		coord.store.RecordLifecycleEvent(LifecycleEvent{
 			UserID: userID, Type: "reactivation_cold", Success: false,
 			Error: msg,
@@ -265,7 +288,9 @@ func (coord *Coordinator) coldReactivate(userID string) {
 	// ── Step 1: Select machines ──
 	primary, secondary, err := coord.store.SelectMachines()
 	if err != nil {
-		fail("select_machines", err)
+		opID := generateOpID()
+		coord.store.CreateOperation(opID, "reactivation_cold", userID, map[string]interface{}{})
+		fail(opID, "select_machines", err)
 		return
 	}
 
@@ -278,7 +303,21 @@ func (coord *Coordinator) coldReactivate(userID string) {
 	coord.store.CreateBipod(userID, primary.MachineID, "primary", primaryMinor)
 	coord.store.CreateBipod(userID, secondary.MachineID, "secondary", secondaryMinor)
 
+	opID := generateOpID()
+	coord.store.CreateOperation(opID, "reactivation_cold", userID, map[string]interface{}{
+		"primary_machine":   primary.MachineID,
+		"secondary_machine": secondary.MachineID,
+		"primary_address":   primary.Address,
+		"secondary_address": secondary.Address,
+		"port":              port,
+		"primary_minor":     primaryMinor,
+		"secondary_minor":   secondaryMinor,
+		"backup_path":       user.BackupPath,
+		"backup_bucket":     user.BackupBucket,
+	})
+
 	logger.Info("Machines selected", "primary", primary.MachineID, "secondary", secondary.MachineID)
+	coord.step(opID, "reactivate-cold-machines-selected")
 
 	primaryClient := NewMachineClient(primary.Address)
 	secondaryClient := NewMachineClient(secondary.Address)
@@ -286,17 +325,18 @@ func (coord *Coordinator) coldReactivate(userID string) {
 	// ── Step 2: Create images ──
 	primaryResp, err := primaryClient.CreateImage(userID, user.ImageSizeMB)
 	if err != nil {
-		fail("image_primary", err)
+		fail(opID, "image_primary", err)
 		return
 	}
 	secondaryResp, err := secondaryClient.CreateImage(userID, user.ImageSizeMB)
 	if err != nil {
-		fail("image_secondary", err)
+		fail(opID, "image_secondary", err)
 		return
 	}
 
 	coord.store.SetBipodLoopDevice(userID, primary.MachineID, primaryResp.LoopDevice)
 	coord.store.SetBipodLoopDevice(userID, secondary.MachineID, secondaryResp.LoopDevice)
+	coord.step(opID, "reactivate-cold-images-created")
 
 	// ── Step 3: Configure DRBD ──
 	primaryAddr := stripPort(primary.Address)
@@ -312,26 +352,28 @@ func (coord *Coordinator) coldReactivate(userID string) {
 	}
 
 	if _, err := primaryClient.DRBDCreate(userID, drbdReq); err != nil {
-		fail("drbd_primary", err)
+		fail(opID, "drbd_primary", err)
 		return
 	}
 	if _, err := secondaryClient.DRBDCreate(userID, drbdReq); err != nil {
-		fail("drbd_secondary", err)
+		fail(opID, "drbd_secondary", err)
 		return
 	}
+	coord.step(opID, "reactivate-cold-drbd-configured")
 
 	// ── Step 4: Promote primary ──
 	if _, err := primaryClient.DRBDPromote(userID); err != nil {
-		fail("drbd_promote", err)
+		fail(opID, "drbd_promote", err)
 		return
 	}
+	coord.step(opID, "reactivate-cold-promoted")
 
-	// ── Step 5: Wait for DRBD sync (blank → blank, fast) ──
+	// ── Step 5: Wait for DRBD sync ──
 	syncTimeout := 60 * time.Second
 	syncStart := time.Now()
 	for {
 		if time.Since(syncStart) > syncTimeout {
-			fail("drbd_sync", fmt.Errorf("sync timeout"))
+			fail(opID, "drbd_sync", fmt.Errorf("sync timeout"))
 			return
 		}
 		status, err := primaryClient.DRBDStatus(userID)
@@ -345,37 +387,42 @@ func (coord *Coordinator) coldReactivate(userID string) {
 		time.Sleep(2 * time.Second)
 	}
 	logger.Info("DRBD sync complete")
+	coord.step(opID, "reactivate-cold-synced")
 
-	// ── Step 6: Format Btrfs (bare mode — no workspace) ──
+	// ── Step 6: Format Btrfs (bare mode) ──
 	if _, err := primaryClient.FormatBtrfsBare(userID); err != nil {
-		fail("format_btrfs_bare", err)
+		fail(opID, "format_btrfs_bare", err)
 		return
 	}
 	logger.Info("Btrfs formatted (bare)")
+	coord.step(opID, "reactivate-cold-formatted")
 
 	// ── Step 7: Restore from B2 ──
 	restoreReq := &shared.RestoreRequest{
 		BucketName:   user.BackupBucket,
 		B2Path:       user.BackupPath,
-		SnapshotName: "", // Will be discovered from the received subvolume
+		SnapshotName: "",
 	}
 	restoreResp, err := primaryClient.Restore(userID, restoreReq)
 	if err != nil {
-		fail("restore", err)
+		fail(opID, "restore", err)
 		return
 	}
 	logger.Info("Restore complete", "snapshot", restoreResp.SnapshotName)
+	coord.step(opID, "reactivate-cold-restored")
 
 	// ── Step 8: Start container ──
 	if _, err := primaryClient.ContainerStart(userID); err != nil {
-		fail("container_start", err)
+		fail(opID, "container_start", err)
 		return
 	}
 	logger.Info("Container started")
+	coord.step(opID, "reactivate-cold-container-started")
 
 	// ── Step 9: Update state ──
 	coord.store.SetUserStatus(userID, "running", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
+	coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "reactivation_cold", Success: true,
@@ -401,11 +448,15 @@ func (coord *Coordinator) evictUser(userID string) {
 		return
 	}
 
+	opID := generateOpID()
+	coord.store.CreateOperation(opID, "eviction", userID, map[string]interface{}{
+		"backup_exists": user.BackupExists,
+	})
+
 	// ── Safety check: B2 backup must exist ──
 	if !user.BackupExists {
 		logger.Warn("No B2 backup — attempting backup before eviction")
 
-		// Find a machine with the user's bipod
 		bipods := coord.store.GetBipods(userID)
 		backupDone := false
 		for _, b := range bipods {
@@ -419,7 +470,6 @@ func (coord *Coordinator) evictUser(userID string) {
 
 			client := NewMachineClient(m.Address)
 
-			// Promote temporarily for snapshot/backup
 			client.DRBDPromote(userID)
 
 			snapName := fmt.Sprintf("evict-%s", time.Now().UTC().Format("20060102T150405Z"))
@@ -452,6 +502,7 @@ func (coord *Coordinator) evictUser(userID string) {
 
 		if !backupDone {
 			logger.Error("Cannot evict — no B2 backup and backup attempt failed")
+			coord.store.FailOperation(opID, "no backup exists and backup attempt failed")
 			coord.store.RecordLifecycleEvent(LifecycleEvent{
 				UserID: userID, Type: "eviction", Success: false,
 				Error: "no backup exists and backup attempt failed",
@@ -460,6 +511,8 @@ func (coord *Coordinator) evictUser(userID string) {
 			return
 		}
 	}
+
+	coord.step(opID, "evict-backup-verified")
 
 	// ── Set status → "evicting" ──
 	coord.store.SetUserStatus(userID, "evicting", "")
@@ -474,15 +527,12 @@ func (coord *Coordinator) evictUser(userID string) {
 		}
 		client := NewMachineClient(m.Address)
 
-		// Disconnect DRBD first (ignore errors)
 		client.DRBDDisconnect(userID)
 
-		// Destroy DRBD resource
 		if err := client.DRBDDestroy(userID); err != nil {
 			logger.Warn("DRBD destroy failed (non-fatal)", "machine", b.MachineID, "error", err)
 		}
 
-		// Delete image
 		if err := client.DeleteUser(userID); err != nil {
 			logger.Warn("Image delete failed (non-fatal)", "machine", b.MachineID, "error", err)
 		}
@@ -490,10 +540,13 @@ func (coord *Coordinator) evictUser(userID string) {
 		logger.Info("Cleaned up on machine", "machine", b.MachineID)
 	}
 
+	coord.step(opID, "evict-resources-cleaned")
+
 	// ── Update state ──
 	coord.store.ClearUserBipods(userID)
 	coord.store.SetUserStatus(userID, "evicted", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
+	coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "eviction", Success: true,

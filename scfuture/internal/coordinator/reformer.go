@@ -33,8 +33,7 @@ func StartReformer(store *Store, coord *Coordinator) {
 }
 
 // cleanStaleBipodsOnActiveMachines cleans up stale bipods on machines that have
-// returned to active status. This runs on every reformer tick, independent of
-// whether the user is degraded or running.
+// returned to active status.
 func (coord *Coordinator) cleanStaleBipodsOnActiveMachines() {
 	staleBipods := coord.store.GetAllStaleBipodsOnActiveMachines()
 	if len(staleBipods) == 0 {
@@ -50,11 +49,9 @@ func (coord *Coordinator) cleanStaleBipodsOnActiveMachines() {
 		staleMachine := coord.store.GetMachine(stale.MachineID)
 		if staleMachine != nil {
 			client := NewMachineClient(staleMachine.Address)
-			// Destroy DRBD resource (ignore errors — may already be down)
 			if err := client.DRBDDestroy(stale.UserID); err != nil {
 				logger.Warn("Stale DRBD destroy failed (non-fatal)", "error", err)
 			}
-			// Delete image
 			if err := client.DeleteUser(stale.UserID); err != nil {
 				logger.Warn("Stale image delete failed (non-fatal)", "error", err)
 			}
@@ -86,24 +83,20 @@ func (coord *Coordinator) reformUser(userID string) {
 	// Re-check status (may have changed since scan)
 	user := coord.store.GetUser(userID)
 	if user == nil || user.Status != "running_degraded" {
-		logger.Info("Skipping — user not in running_degraded state", "status", user.Status)
+		logger.Info("Skipping — user not in running_degraded state")
 		return
 	}
 
 	// ── Step 0: Clean up stale bipods on active machines ──
 	staleBipods := coord.store.GetStaleBipodsOnActiveMachines(userID)
 	for _, stale := range staleBipods {
-		logger.Info("Cleaning up stale bipod on returned machine",
-			"machine_id", stale.MachineID,
-		)
+		logger.Info("Cleaning up stale bipod on returned machine", "machine_id", stale.MachineID)
 		staleMachine := coord.store.GetMachine(stale.MachineID)
 		if staleMachine != nil {
 			client := NewMachineClient(staleMachine.Address)
-			// Destroy DRBD resource (ignore errors — may already be down)
 			if err := client.DRBDDestroy(userID); err != nil {
 				logger.Warn("Stale DRBD destroy failed (non-fatal)", "error", err)
 			}
-			// Delete image
 			if err := client.DeleteUser(userID); err != nil {
 				logger.Warn("Stale image delete failed (non-fatal)", "error", err)
 			}
@@ -116,7 +109,6 @@ func (coord *Coordinator) reformUser(userID string) {
 	coord.store.SetUserStatus(userID, "reforming", "")
 
 	// ── Step 2: Select new secondary machine ──
-	// Exclude the current primary
 	excludeIDs := []string{user.PrimaryMachine}
 	newSecondary, err := coord.store.SelectOneSecondary(excludeIDs)
 	if err != nil {
@@ -126,10 +118,6 @@ func (coord *Coordinator) reformUser(userID string) {
 	}
 
 	newMinor := coord.store.AllocateMinor(newSecondary.MachineID)
-	logger.Info("Selected new secondary",
-		"new_secondary", newSecondary.MachineID,
-		"minor", newMinor,
-	)
 
 	// Get primary machine info
 	primaryMachine := coord.store.GetMachine(user.PrimaryMachine)
@@ -139,7 +127,7 @@ func (coord *Coordinator) reformUser(userID string) {
 		return
 	}
 
-	// Get primary bipod — find the bipod on user's primary machine
+	// Get primary bipod
 	var primaryBipod *Bipod
 	bipods := coord.store.GetBipods(userID)
 	for _, b := range bipods {
@@ -154,6 +142,27 @@ func (coord *Coordinator) reformUser(userID string) {
 		return
 	}
 
+	// Create operation
+	opID := generateOpID()
+	coord.store.CreateOperation(opID, "reformation", userID, map[string]interface{}{
+		"primary_machine":   user.PrimaryMachine,
+		"primary_address":   primaryMachine.Address,
+		"new_secondary":     newSecondary.MachineID,
+		"secondary_address": newSecondary.Address,
+		"new_minor":         newMinor,
+		"primary_minor":     primaryBipod.DRBDMinor,
+		"primary_loop":      primaryBipod.LoopDevice,
+		"port":              user.DRBDPort,
+	})
+
+	coord.store.CreateBipod(userID, newSecondary.MachineID, "secondary", newMinor)
+
+	logger.Info("Selected new secondary",
+		"new_secondary", newSecondary.MachineID,
+		"minor", newMinor, "op_id", opID,
+	)
+	coord.step(opID, "reform-machine-selected")
+
 	primaryClient := NewMachineClient(primaryMachine.Address)
 	secondaryClient := NewMachineClient(newSecondary.Address)
 
@@ -165,6 +174,7 @@ func (coord *Coordinator) reformUser(userID string) {
 	if err != nil {
 		logger.Error("Create image on new secondary failed", "error", err)
 		coord.store.SetUserStatus(userID, "running_degraded", "image create failed: "+err.Error())
+		coord.store.FailOperation(opID, "image create: "+err.Error())
 		coord.store.RecordReformationEvent(ReformationEvent{
 			UserID: userID, OldSecondary: "", NewSecondary: newSecondary.MachineID,
 			Success: false, Error: "image create: " + err.Error(),
@@ -173,9 +183,11 @@ func (coord *Coordinator) reformUser(userID string) {
 		return
 	}
 	secondaryLoop := imgResp.LoopDevice
+	coord.store.SetBipodLoopDevice(userID, newSecondary.MachineID, secondaryLoop)
 	logger.Info("Image created on new secondary", "loop", secondaryLoop)
+	coord.step(opID, "reform-image-created")
 
-	// Build DRBD config request — same config for both sides
+	// Build DRBD config request
 	drbdReq := &shared.DRBDCreateRequest{
 		ResourceName: "user-" + userID,
 		Nodes: []shared.DRBDNode{
@@ -196,13 +208,13 @@ func (coord *Coordinator) reformUser(userID string) {
 	}
 
 	// ── Step 4: Configure DRBD on new secondary ──
-	// New secondary writes config, creates metadata, runs drbdadm up
 	_, err = secondaryClient.DRBDCreate(userID, drbdReq)
 	if err != nil {
 		logger.Error("DRBD create on new secondary failed", "error", err)
-		// Cleanup: delete image on new secondary
 		secondaryClient.DeleteUser(userID)
+		coord.store.RemoveBipod(userID, newSecondary.MachineID)
 		coord.store.SetUserStatus(userID, "running_degraded", "drbd create failed: "+err.Error())
+		coord.store.FailOperation(opID, "drbd create: "+err.Error())
 		coord.store.RecordReformationEvent(ReformationEvent{
 			UserID: userID, OldSecondary: "", NewSecondary: newSecondary.MachineID,
 			Success: false, Error: "drbd create: " + err.Error(),
@@ -211,36 +223,35 @@ func (coord *Coordinator) reformUser(userID string) {
 		return
 	}
 	logger.Info("DRBD configured on new secondary")
+	coord.step(opID, "reform-drbd-configured")
 
 	// ── Step 5: Disconnect dead peer on primary ──
 	_, err = primaryClient.DRBDDisconnect(userID)
 	if err != nil {
-		logger.Warn("DRBD disconnect on primary failed (non-fatal, may already be disconnected)", "error", err)
-		// Continue — the disconnect may fail because the resource is already StandAlone
-		// The reconfigure step will handle reconnection
+		logger.Warn("DRBD disconnect on primary failed (non-fatal)", "error", err)
 	}
 	logger.Info("Dead peer disconnected on primary")
+	coord.step(opID, "reform-old-disconnected")
 
 	// ── Step 6: Reconfigure DRBD on primary ──
 	reconfigReq := &shared.DRBDReconfigureRequest{
 		Nodes: drbdReq.Nodes,
 		Port:  drbdReq.Port,
-		Force: false, // Try adjust first
+		Force: false,
 	}
 
 	var reconfigMethod string
 	reconfigResp, err := primaryClient.DRBDReconfigure(userID, reconfigReq)
 	if err != nil {
-		// Adjust failed — try fallback with container lifecycle
 		logger.Warn("drbdadm adjust failed, attempting down/up fallback", "error", err)
 
-		// Stop container on primary
 		if stopErr := primaryClient.ContainerStop(userID); stopErr != nil {
 			logger.Error("Container stop failed during fallback", "error", stopErr)
-			// Cleanup
 			secondaryClient.DRBDDestroy(userID)
 			secondaryClient.DeleteUser(userID)
+			coord.store.RemoveBipod(userID, newSecondary.MachineID)
 			coord.store.SetUserStatus(userID, "running_degraded", "container stop failed during reconfigure: "+stopErr.Error())
+			coord.store.FailOperation(opID, "container stop for fallback: "+stopErr.Error())
 			coord.store.RecordReformationEvent(ReformationEvent{
 				UserID: userID, OldSecondary: "", NewSecondary: newSecondary.MachineID,
 				Success: false, Error: "container stop for fallback: " + stopErr.Error(),
@@ -249,16 +260,16 @@ func (coord *Coordinator) reformUser(userID string) {
 			return
 		}
 
-		// Force reconfigure (down/up/promote)
 		reconfigReq.Force = true
 		reconfigResp, err = primaryClient.DRBDReconfigure(userID, reconfigReq)
 		if err != nil {
 			logger.Error("Force reconfigure failed", "error", err)
-			// Try to restart container even after failure
 			primaryClient.ContainerStart(userID)
 			secondaryClient.DRBDDestroy(userID)
 			secondaryClient.DeleteUser(userID)
+			coord.store.RemoveBipod(userID, newSecondary.MachineID)
 			coord.store.SetUserStatus(userID, "running_degraded", "drbd reconfigure (force) failed: "+err.Error())
+			coord.store.FailOperation(opID, "drbd reconfigure force: "+err.Error())
 			coord.store.RecordReformationEvent(ReformationEvent{
 				UserID: userID, OldSecondary: "", NewSecondary: newSecondary.MachineID,
 				Success: false, Error: "drbd reconfigure force: " + err.Error(),
@@ -267,10 +278,10 @@ func (coord *Coordinator) reformUser(userID string) {
 			return
 		}
 
-		// Restart container
 		if _, startErr := primaryClient.ContainerStart(userID); startErr != nil {
 			logger.Error("Container restart after force reconfigure failed", "error", startErr)
 			coord.store.SetUserStatus(userID, "running_degraded", "container restart after reconfigure failed: "+startErr.Error())
+			coord.store.FailOperation(opID, "container restart: "+startErr.Error())
 			coord.store.RecordReformationEvent(ReformationEvent{
 				UserID: userID, OldSecondary: "", NewSecondary: newSecondary.MachineID,
 				Success: false, Error: "container restart: " + startErr.Error(), Method: "down_up",
@@ -284,16 +295,15 @@ func (coord *Coordinator) reformUser(userID string) {
 		reconfigMethod = reconfigResp.Method
 	}
 	logger.Info("DRBD reconfigured on primary", "method", reconfigMethod)
+	coord.step(opID, "reform-primary-reconfigured")
 
 	// ── Step 7: Wait for DRBD sync ──
 	syncStart := time.Now()
 	for {
 		if time.Since(syncStart) > SyncTimeout {
 			logger.Warn("DRBD sync timeout — leaving bipod in place")
-			// Don't cleanup — the sync may complete eventually
-			coord.store.CreateBipod(userID, newSecondary.MachineID, "secondary", newMinor)
-			coord.store.SetBipodLoopDevice(userID, newSecondary.MachineID, secondaryLoop)
 			coord.store.SetUserStatus(userID, "running_degraded", "drbd sync timeout after reformation")
+			coord.store.FailOperation(opID, "sync timeout")
 			coord.store.RecordReformationEvent(ReformationEvent{
 				UserID: userID, OldSecondary: "", NewSecondary: newSecondary.MachineID,
 				Success: false, Error: "sync timeout", Method: reconfigMethod,
@@ -321,15 +331,15 @@ func (coord *Coordinator) reformUser(userID string) {
 		logger.Info("DRBD syncing", "peer_disk", status.PeerDiskState, "progress", progress)
 		time.Sleep(2 * time.Second)
 	}
+	coord.step(opID, "reform-synced")
 
 	// ── Step 8: Update state ──
-	coord.store.CreateBipod(userID, newSecondary.MachineID, "secondary", newMinor)
-	coord.store.SetBipodLoopDevice(userID, newSecondary.MachineID, secondaryLoop)
 	coord.store.SetUserStatus(userID, "running", "")
+	coord.store.CompleteOperation(opID)
 
 	coord.store.RecordReformationEvent(ReformationEvent{
 		UserID:       userID,
-		OldSecondary: "", // Was already cleaned up
+		OldSecondary: "",
 		NewSecondary: newSecondary.MachineID,
 		Success:      true,
 		Method:       reconfigMethod,
@@ -345,7 +355,6 @@ func (coord *Coordinator) reformUser(userID string) {
 	)
 }
 
-// reformerStripPort extracts the IP from an "ip:port" address string.
 func reformerStripPort(address string) string {
 	idx := strings.LastIndex(address, ":")
 	if idx == -1 {

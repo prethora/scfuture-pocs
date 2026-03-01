@@ -1613,24 +1613,24 @@ The original test checked all 3 users for a 'stale' bipod on fleet-1, but placem
      Data integrity verified across failover
      62/62 checks passed (1 test fix: Issue #31)
 
-🔲 Layer 4.4: Bipod reformation + dead machine return
+✅ Layer 4.4: Bipod reformation + dead machine return — 91/91 checks
      Rebuild second copy after failover, zero-downtime DRBD peer replacement
      Test drbdadm disconnect/adjust for live reconfiguration
      Clean up orphaned resources on returning machines
 
-🔲 Layer 4.5: Suspension, reactivation, deletion
+✅ Layer 4.5: Suspension, reactivation, deletion — 63/63 checks
      Full user lifecycle management
 
-🔲 Layer 4.6: Reconciliation + crash hardening
+✅ Layer 4.6: Reconciliation + crash hardening — 67/67 checks
      Migrate coordinator state from in-memory/JSON to Supabase (Postgres)
      Operations table for crash-safe multi-step operation tracking
      Coordinator advisory lock (pg_try_advisory_lock) for singleton enforcement
      Five-phase startup reconciliation (discover → reconcile → resume → cleanup → start)
-     25-30 deterministic fault injection checkpoints across all operations
-     Consistency checker (8 invariants, SSH ground truth vs DB)
-     Chaos mode testing (50 iterations, 5% crash probability)
-     Graceful shutdown (drain in-progress ops before exit)
-     See detailed Layer 4.6 Preview section below for full extracted intelligence
+     33 deterministic fault injection checkpoints across all operations
+     Consistency checker (12 invariants, SSH ground truth vs DB)
+     Chaos mode testing (5% random crash probability)
+     Graceful shutdown (context cancel → HTTP drain → DB close)
+     See detailed Layer 4.6 Preview section below for original design intelligence
 
 🔲 Layer 5: Live migration
      Pause/promote/unpause for rebalancing
@@ -2560,6 +2560,42 @@ In priority order:
 
 7. **External Postgres (Supabase) rationale** — "Killing the coordinator process risks database state if the DB is local. External managed database eliminates this variable."
 
+### Layer 4.6 Results — CLOSED
+
+**Result: 67/67 checks passing (Run #12, 2026-03-01)**
+
+| Phase | Description | Result |
+|-------|------------|--------|
+| 0 | Prerequisites | 9/9 |
+| 1 | Happy Path — Provision & Verify Postgres | 10/10 |
+| 2 | Provisioning Crash Tests (F1-F7) | 8/8 |
+| 3 | Failover Crash Tests (F8-F10) | 3/3 |
+| 4 | Suspension Crash Tests (F17-F20) | 5/5 |
+| 5 | Warm Reactivation Crash Tests (F21-F23) | 4/4 |
+| 6 | Eviction Crash Tests (F32-F33) | 3/3 |
+| 7 | Cold Reactivation Crash Tests (F24-F31) | 9/9 |
+| 8 | Reformation Crash Tests (F11-F16) | 6/6 |
+| 9 | Chaos Mode — Random Crash Stress | 4/4 |
+| 10 | Graceful Shutdown | 3/3 |
+| 11 | Final Consistency & Cleanup | 3/3 |
+
+**Key implementation details:**
+- **Postgres migration**: All state moved from in-memory + JSON to Supabase Postgres via pgbouncer (port 6543). Write-through pattern: every mutation writes to Postgres first, then updates in-memory cache.
+- **Advisory lock singleton**: `pg_try_advisory_lock(12345)` ensures only one coordinator runs. Stale locks from pgbouncer after crash are cleared via `pg_terminate_backend()`.
+- **Five-phase startup reconciliation**: probe machines → reconcile DB → resume operations → clean orphans → handle offline machines. Runs BEFORE goroutines/HTTP server.
+- **33 fault injection points**: Deterministic crash via `FAIL_AT` env var + `coord.step(opID, stepName)` → `coord.checkFault(stepName)` → `os.Exit(1)`.
+- **Chaos mode**: Random 5% crash probability via `CHAOS_MODE=true` env var.
+- **12 system invariants** verified by `check_consistency` function after each crash test phase.
+- **One external dependency added**: `github.com/lib/pq` (Postgres driver). First `go.sum` in the project.
+
+**Bugs found & fixed during testing:**
+- Advisory lock stale after crash through pgbouncer → `pg_terminate_backend()` to forcibly release
+- Container not restarted after interrupted suspension revert → added `ContainerStart` in `resumeSuspension`
+- Evicted users retaining bipods from crashed cold reactivation → added cleanup in `resumeColdReactivation` and Phase 2 reconciliation
+- Running users with destroyed resources after subsequent crash tests → Phase 2 marks running users with no live bipods as "failed"
+- Auto-eviction interfering with crash tests → increased retention timers (600s/1200s)
+- SSH drops killing test script → added retry loops to all SSH commands in `crash_test` and `deploy.sh`
+
 ---
 
 ### PoC Progression
@@ -2570,6 +2606,6 @@ Layer 4.2: Coordinator Happy Path               ✅ 55/55 checks
 Layer 4.3: Heartbeat Failure Detection           ✅ 62/62 checks
 Layer 4.4: Bipod Reformation                     ✅ 91/91 checks
 Layer 4.5: Suspension / Reactivation / Deletion  ✅ 63/63 checks
-Layer 4.6: Crash Recovery / Reconciliation       ⬜ Next
-Layer 5:   Live Migration                        ⬜
+Layer 4.6: Crash Recovery / Reconciliation       ✅ 67/67 checks
+Layer 5:   Live Migration                        ⬜ Next
 ```
