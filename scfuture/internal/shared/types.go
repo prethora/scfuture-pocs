@@ -150,6 +150,19 @@ type MachineStatus struct {
 	LastHeartbeat string   `json:"last_heartbeat"`
 }
 
+// ─── Failover types (from coordinator healthcheck) ───
+
+type FailoverEventResponse struct {
+	UserID      string `json:"user_id"`
+	FromMachine string `json:"from_machine"`
+	ToMachine   string `json:"to_machine"`
+	Type        string `json:"type"`
+	Success     bool   `json:"success"`
+	Error       string `json:"error,omitempty"`
+	DurationMS  int64  `json:"duration_ms"`
+	Timestamp   string `json:"timestamp"`
+}
+
 type UserStatusDTO struct {
 	ImageExists      bool   `json:"image_exists"`
 	ImagePath        string `json:"image_path"`

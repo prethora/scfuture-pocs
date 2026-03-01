@@ -22,22 +22,36 @@ type Store struct {
 	nextPort  int            // next DRBD port to allocate (starts at 7900)
 	nextMinor map[string]int // per-machine next DRBD minor (starts at 0)
 
+	failoverEvents []FailoverEvent
+
 	dataDir string
 }
 
 type Machine struct {
-	MachineID     string    `json:"machine_id"`
-	Address       string    `json:"address"`
-	PublicAddress string    `json:"public_address"`
-	Status        string    `json:"status"`
-	DiskTotalMB   int64     `json:"disk_total_mb"`
-	DiskUsedMB    int64     `json:"disk_used_mb"`
-	RAMTotalMB    int64     `json:"ram_total_mb"`
-	RAMUsedMB     int64     `json:"ram_used_mb"`
-	ActiveAgents  int       `json:"active_agents"`
-	MaxAgents     int       `json:"max_agents"`
-	RunningAgents []string  `json:"running_agents"`
-	LastHeartbeat time.Time `json:"last_heartbeat"`
+	MachineID       string    `json:"machine_id"`
+	Address         string    `json:"address"`
+	PublicAddress   string    `json:"public_address"`
+	Status          string    `json:"status"`
+	StatusChangedAt time.Time `json:"status_changed_at"`
+	DiskTotalMB     int64     `json:"disk_total_mb"`
+	DiskUsedMB      int64     `json:"disk_used_mb"`
+	RAMTotalMB      int64     `json:"ram_total_mb"`
+	RAMUsedMB       int64     `json:"ram_used_mb"`
+	ActiveAgents    int       `json:"active_agents"`
+	MaxAgents       int       `json:"max_agents"`
+	RunningAgents   []string  `json:"running_agents"`
+	LastHeartbeat   time.Time `json:"last_heartbeat"`
+}
+
+type FailoverEvent struct {
+	UserID      string    `json:"user_id"`
+	FromMachine string    `json:"from_machine"`
+	ToMachine   string    `json:"to_machine"`
+	Type        string    `json:"type"`
+	Success     bool      `json:"success"`
+	Error       string    `json:"error,omitempty"`
+	DurationMS  int64     `json:"duration_ms"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 type User struct {
@@ -102,6 +116,17 @@ func (s *Store) UpdateHeartbeat(req *shared.FleetHeartbeatRequest) {
 		slog.Warn("Heartbeat from unknown machine", "machine_id", req.MachineID)
 		return
 	}
+
+	// Resurrection: machine came back from dead/suspect
+	if m.Status == "dead" || m.Status == "suspect" {
+		slog.Info("[HEALTH] Machine resurrected",
+			"machine_id", req.MachineID,
+			"was", m.Status,
+		)
+		m.Status = "active"
+		m.StatusChangedAt = time.Now()
+	}
+
 	m.DiskTotalMB = req.DiskTotalMB
 	m.DiskUsedMB = req.DiskUsedMB
 	m.RAMTotalMB = req.RAMTotalMB
@@ -301,11 +326,12 @@ func (s *Store) SelectMachines() (primary *Machine, secondary *Machine, err erro
 }
 
 type persistState struct {
-	Machines  map[string]*Machine `json:"machines"`
-	Users     map[string]*User    `json:"users"`
-	Bipods    map[string]*Bipod   `json:"bipods"`
-	NextPort  int                 `json:"next_port"`
-	NextMinor map[string]int      `json:"next_minor"`
+	Machines       map[string]*Machine `json:"machines"`
+	Users          map[string]*User    `json:"users"`
+	Bipods         map[string]*Bipod   `json:"bipods"`
+	NextPort       int                 `json:"next_port"`
+	NextMinor      map[string]int      `json:"next_minor"`
+	FailoverEvents []FailoverEvent     `json:"failover_events"`
 }
 
 func (s *Store) persist() {
@@ -313,11 +339,12 @@ func (s *Store) persist() {
 		return
 	}
 	state := persistState{
-		Machines:  s.machines,
-		Users:     s.users,
-		Bipods:    s.bipods,
-		NextPort:  s.nextPort,
-		NextMinor: s.nextMinor,
+		Machines:       s.machines,
+		Users:          s.users,
+		Bipods:         s.bipods,
+		NextPort:       s.nextPort,
+		NextMinor:      s.nextMinor,
+		FailoverEvents: s.failoverEvents,
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -329,4 +356,108 @@ func (s *Store) persist() {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		slog.Warn("Failed to persist state", "error", err)
 	}
+}
+
+// CheckMachineHealth scans all machines, updates statuses based on heartbeat age.
+// Returns the list of machine IDs that just transitioned to "dead".
+func (s *Store) CheckMachineHealth(suspectThreshold, deadThreshold time.Duration) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var newlyDead []string
+	now := time.Now()
+
+	for id, m := range s.machines {
+		elapsed := now.Sub(m.LastHeartbeat)
+		var newStatus string
+
+		switch {
+		case elapsed > deadThreshold:
+			newStatus = "dead"
+		case elapsed > suspectThreshold:
+			newStatus = "suspect"
+		default:
+			newStatus = "active"
+		}
+
+		if newStatus != m.Status {
+			oldStatus := m.Status
+			m.Status = newStatus
+			m.StatusChangedAt = now
+			slog.Info("[HEALTH] Machine status changed",
+				"machine_id", id,
+				"from", oldStatus,
+				"to", newStatus,
+				"last_heartbeat_ago", elapsed.String(),
+			)
+			if newStatus == "dead" {
+				newlyDead = append(newlyDead, id)
+			}
+		}
+	}
+
+	s.persist()
+	return newlyDead
+}
+
+// GetUsersOnMachine returns all users that have a bipod on the given machine.
+func (s *Store) GetUsersOnMachine(machineID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	seen := make(map[string]bool)
+	var userIDs []string
+	for _, b := range s.bipods {
+		if b.MachineID == machineID && !seen[b.UserID] {
+			seen[b.UserID] = true
+			userIDs = append(userIDs, b.UserID)
+		}
+	}
+	return userIDs
+}
+
+// GetSurvivingBipod returns the bipod NOT on the dead machine for a given user.
+// Returns nil if no surviving bipod exists (both machines dead).
+func (s *Store) GetSurvivingBipod(userID, deadMachineID string) *Bipod {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, b := range s.bipods {
+		if b.UserID == userID && b.MachineID != deadMachineID && b.Role != "stale" {
+			clone := *b
+			return &clone
+		}
+	}
+	return nil
+}
+
+// SetBipodRole updates a bipod's role.
+func (s *Store) SetBipodRole(userID, machineID, role string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := userID + ":" + machineID
+	b, ok := s.bipods[key]
+	if !ok {
+		return
+	}
+	b.Role = role
+	s.persist()
+}
+
+// RecordFailoverEvent appends a failover event.
+func (s *Store) RecordFailoverEvent(event FailoverEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failoverEvents = append(s.failoverEvents, event)
+	s.persist()
+}
+
+// GetFailoverEvents returns all recorded failover events.
+func (s *Store) GetFailoverEvents() []FailoverEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]FailoverEvent, len(s.failoverEvents))
+	copy(result, s.failoverEvents)
+	return result
 }

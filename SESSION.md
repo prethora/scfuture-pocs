@@ -1385,6 +1385,125 @@ No issues were encountered, so no drift analysis is needed. All established patt
 
 3. **Layer 4.6 (crash recovery)** — The in-memory store persists to `state.json` but has no crash recovery logic. Layer 4.6 will migrate to Postgres and add startup reconciliation (compare coordinator state with machine agent reality).
 
+### Layer 4.3: Heartbeat Failure Detection & Automatic Failover
+
+#### Goal
+
+Add automatic failure detection and failover to the coordinator. When a fleet machine stops sending heartbeats, the coordinator detects it (active → suspect at 30s → dead at 60s) and automatically fails over affected users: promoting DRBD on the surviving secondary and starting containers on the new primary. Users whose secondary dies are marked degraded. Data integrity is preserved across failover.
+
+#### Architecture
+
+Same topology as Layer 4.2: 1 coordinator + 3 fleet machines on Hetzner Cloud (l43-* prefix). The test kills fleet-1 via `hcloud server shutdown`, waits for automatic detection and failover, then verifies data survived.
+
+#### New Code Written
+
+**Coordinator modifications (4 files modified):**
+- `internal/coordinator/store.go` — Added `StatusChangedAt` to Machine, `FailoverEvent` struct, `failoverEvents` to Store, 6 new methods (`CheckMachineHealth`, `GetUsersOnMachine`, `GetSurvivingBipod`, `SetBipodRole`, `RecordFailoverEvent`, `GetFailoverEvents`), resurrection handling in `UpdateHeartbeat`, updated `persistState`/`persist()`
+- `internal/coordinator/server.go` — Added `GET /api/failovers` route + handler, `GetStore()` accessor
+- `internal/shared/types.go` — Added `FailoverEventResponse` type
+- `cmd/coordinator/main.go` — Added `StartHealthChecker` call
+
+**New files (1 Go + 7 scripts):**
+- `internal/coordinator/healthcheck.go` — Health checker goroutine (10s tick, 30s suspect, 60s dead), `failoverMachine`, `failoverUser` with full promote + container start sequence
+- `scripts/layer-4.3/` — run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh, cloud-init/coordinator.yaml, cloud-init/fleet.yaml
+
+#### Health Check State Machine
+
+```
+Machine: active ──(30s)──▶ suspect ──(60s)──▶ dead ──(heartbeat resumes)──▶ active
+User:    running ──(primary dies)──▶ failing_over ──▶ running (on new primary)
+         running ──(secondary dies)──▶ running_degraded
+```
+
+#### Failover Sequence (primary death)
+
+1. Identify surviving bipod (the secondary on another machine)
+2. Set user status → `failing_over`
+3. Mark dead machine's bipod role → `stale`
+4. POST `/images/{user_id}/drbd/promote` on surviving machine (uses `--force`, works with disconnected peer)
+5. POST `/containers/{user_id}/start` on surviving machine
+6. Update bipod roles and user's primary machine
+7. Set user status → `running`
+8. Record failover event
+
+#### Test Results — 62/62 Checks Passed
+
+```
+═══ Phase 0: Prerequisites ═══                                [13/13]
+  ✓ Coordinator responding, 3 fleet machines registered
+  ✓ All machines active, DRBD loaded, container images built
+  ✓ No failover events initially
+
+═══ Phase 1: Provision Users (baseline) ═══                   [12/12]
+  ✓ alice, bob, charlie provisioned and running
+  ✓ Test data written to each user's container
+  ✓ DRBD replication healthy (UpToDate) for all users
+
+═══ Phase 2: Kill a Fleet Machine ═══                         [2/2]
+  ✓ fleet-1 shutdown via hcloud
+  ✓ fleet-1 unreachable via SSH
+
+═══ Phase 3: Failure Detection ═══                            [3/3]
+  ✓ fleet-1 detected as dead (within 90s)
+  ✓ fleet-2 and fleet-3 still active
+
+═══ Phase 4: Automatic Failover Verification ═══              [8/8]
+  ✓ alice (primary on fleet-1) → running on fleet-2
+  ✓ bob (secondary on fleet-1) → running_degraded
+  ✓ charlie (no bipod on fleet-1) → running
+  ✓ alice DRBD promoted and container running on new primary
+  ✓ Failover events recorded with correct structure
+
+═══ Phase 5: Data Integrity After Failover ═══                [9/9]
+  ✓ Pre-failover data survived for all 3 users
+  ✓ New data writable after failover
+  ✓ config.json from initial provisioning intact
+
+═══ Phase 6: Unaffected Users & Degraded State ═══            [5/5]
+  ✓ bob marked running_degraded (secondary lost)
+  ✓ bob primary unchanged, container still running
+  ✓ Stale bipods correctly marked on fleet-1
+
+═══ Phase 7: Coordinator State Consistency ═══                [6/6]
+  ✓ Fleet shows fleet-1 dead, others active
+  ✓ No user has fleet-1 as primary
+  ✓ All users in valid state
+  ✓ state.json persisted correctly
+
+═══ Phase 8: Cleanup ═══                                      [4/4]
+  ✓ Surviving machines cleaned and verified
+
+═══════════════════════════════════════════════════
+ ALL PHASES COMPLETE: 62/62 checks passed
+═══════════════════════════════════════════════════
+```
+
+#### Issues Encountered
+
+**Issue #31: Test script checked bipod on fleet-1 for users without one.**
+The original test checked all 3 users for a 'stale' bipod on fleet-1, but placement is algorithmic — charlie's bipod was on fleet-2 and fleet-3, not fleet-1. Fixed by checking whether a user actually has a bipod on fleet-1 before asserting its role.
+
+#### What Was Proven
+
+1. **Automatic failure detection** — Coordinator's health checker goroutine detects machine death within 60 seconds via heartbeat timeout
+2. **Automatic primary failover** — DRBD promote + container start on surviving secondary, user transitions from `running` → `failing_over` → `running` on new primary
+3. **Secondary death handling** — Users whose secondary dies are correctly marked `running_degraded` with no disruption to the running primary
+4. **Data integrity across failover** — All data written before the failure (test.txt, config.json) survives on the new primary. Protocol A async replication means the surviving copy was UpToDate before the failure.
+5. **Failover event recording** — Each failover event captured with user, machines, type, success, duration
+6. **Non-blocking failover** — Each dead machine's failover runs in its own goroutine, not blocking the health checker
+7. **Idempotent promotion** — DRBD `--force` promote works on a secondary with a disconnected peer
+
+#### Drift from Build Prompt
+
+- **Phase 6 bipod check** — The prompt's test script checked all users for stale bipods on fleet-1. Fixed to only check users that actually have bipods on fleet-1 (Issue #31). This is a test improvement, not a code change.
+- **No other drift** — All Go code, API endpoints, failover sequence, and state transitions match the build prompt exactly.
+
+#### Changes That Affect Future Layers
+
+1. **Layer 4.4 (bipod reformation)** — After failover, users are running on a single machine (no replication). Layer 4.4 must: detect single-copy state, select a new secondary, set up DRBD to the new peer, sync, and transition back to fully replicated.
+
+2. **Layer 4.4 (dead machine return)** — When a dead machine's heartbeats resume, the coordinator marks it `active` but does NOT re-integrate bipods. Layer 4.4 must handle: cleaning up stale DRBD resources on the returned machine, potentially using it as a new secondary for users that need bipod reformation.
+
 ---
 
 ## 7. Technology Decisions Log
@@ -1408,6 +1527,8 @@ No issues were encountered, so no drift analysis is needed. All established patt
 | Coordinator state | In-memory + JSON persist | No external deps for happy path; Postgres when crash recovery matters (Layer 4.6) |
 | Coordinator placement | Least-loaded, mutex-protected | Prevents double-placement from concurrent provisioning |
 | Fleet communication | Private IP HTTP | Coordinator uses 10.0.0.x addresses; test harness uses public IPs |
+| Health check interval | 10s tick, 30s suspect, 60s dead | 3 missed heartbeats → suspect, 6 → dead; balances detection speed vs false positives |
+| Failover concurrency | Per-machine goroutine | Each dead machine's failover runs independently; doesn't block health checker |
 | Open source | Yes, entire stack | WordPress.com/org model; trust through transparency |
 | Encryption | LUKS above DRBD (planned) | Protects data at rest; per-user keys in coordinator |
 | Backup compression | zstd | Fast, good ratio, streaming-compatible |
@@ -1451,6 +1572,9 @@ No issues were encountered, so no drift analysis is needed. All established patt
 | `poc-coordinator/schema.sql` | Postgres schema documentation (future migration) |
 | `poc-coordinator/scripts/layer-4.2/` | run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh, cloud-init/ |
 | `master-prompt4.2.md` | Build prompt for Layer 4.2 |
+| `poc-coordinator/internal/coordinator/healthcheck.go` | Layer 4.3: Health checker + failover logic |
+| `poc-coordinator/scripts/layer-4.3/` | run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh, cloud-init/ |
+| `master-prompt4.3.md` | Build prompt for Layer 4.3 |
 
 ---
 
@@ -1482,9 +1606,11 @@ No issues were encountered, so no drift analysis is needed. All established patt
      5 users across 3 fleet machines, balanced placement, data isolation
      55/55 checks passed (first attempt, zero issues)
 
-🔲 Layer 4.3: Heartbeat + failure detection + failover
-     Heartbeat sender/monitor, machine death detection
-     Automatic promotion of surviving secondary, service restored
+✅ Layer 4.3: Heartbeat failure detection + automatic failover
+     Health checker (10s tick, 30s suspect, 60s dead)
+     Automatic DRBD promote + container start on surviving secondary
+     Data integrity verified across failover
+     62/62 checks passed (1 test fix: Issue #31)
 
 🔲 Layer 4.4: Bipod reformation + dead machine return
      Rebuild second copy after failover, zero-downtime DRBD peer replacement

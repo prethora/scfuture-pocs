@@ -1,30 +1,36 @@
 # scfuture — Architecture Document
 
-**Layer:** 4.1 — Machine Agent
+**Layer:** 4.3 — Heartbeat Failure Detection & Automatic Failover
 **Module:** `scfuture` (Go 1.22, standard library only, no external dependencies)
-**Status:** 66/66 test checks passing
+**Status:** 62/62 test checks passing (Layer 4.3), 55/55 (Layer 4.2), 66/66 (Layer 4.1)
 **Last updated:** 2026-03-01
 
 ---
 
 ## 1. System Overview
 
-scfuture is a per-machine HTTP agent that manages the full lifecycle of isolated user environments on a two-node (bipod) infrastructure. Each user gets:
+scfuture is a distributed agent platform consisting of two components:
 
-1. A **sparse disk image** backed by a **loop device**
-2. A **DRBD 9 replicated block device** (Protocol A, async) across two machines
+1. **Coordinator** — a central HTTP server that manages fleet registration, user provisioning, placement, and orchestration across multiple machines.
+2. **Machine Agent** — a per-machine HTTP agent that manages the full lifecycle of isolated user environments (images, DRBD, Btrfs, containers).
+
+Each user gets:
+1. A **sparse disk image** backed by a **loop device** on two machines
+2. A **DRBD 9 replicated block device** (Protocol A, async) forming a bipod
 3. A **Btrfs filesystem** with subvolumes and snapshots on the DRBD device
-4. A **Docker container** that mounts the DRBD block device directly (device-mount pattern — the host never mounts Btrfs)
+4. A **Docker container** that mounts the DRBD block device directly (device-mount pattern)
 
-The agent runs on each machine independently. There is no coordinator yet (that is Layer 4.2). An external caller (test suite, future coordinator) drives both agents via their HTTP APIs.
+The coordinator drives provisioning by calling machine agent HTTP APIs. Machine agents self-register with the coordinator and send heartbeats every 10 seconds. The coordinator runs a health checker that detects machine failures and automatically fails over affected users.
 
 ### Key Design Decisions
 
 - **Device-mount pattern:** Containers receive the raw `/dev/drbdN` device and mount Btrfs internally. The host never mounts the user's filesystem, eliminating host-path leakage in `/proc/mounts`.
 - **Idempotent API:** Every endpoint returns success if the desired state already exists (`already_existed`, `already_formatted`). No endpoint fails on repeated calls.
 - **Per-user locking:** Concurrent requests for different users proceed in parallel. Requests for the same user are serialized via `sync.Mutex` per user ID.
-- **State discovery on startup:** The agent rebuilds its in-memory state from system reality (losetup, DRBD configs, DRBD status, mount table, Docker) rather than persisting state to disk.
+- **State discovery on startup (machine agent):** Rebuilds in-memory state from system reality (losetup, DRBD configs, DRBD status, mount table, Docker).
+- **In-memory state with JSON persistence (coordinator):** All coordinator state lives in `sync.RWMutex`-protected maps. Persisted to `state.json` for debugging, not crash recovery.
 - **Standard library only:** No external Go dependencies. No `go.sum` file.
+- **Balanced placement:** Coordinator selects the 2 least-loaded active machines, excluding any above 85% disk usage.
 
 ---
 
@@ -33,149 +39,339 @@ The agent runs on each machine independently. There is no coordinator yet (that 
 ```
 scfuture/
 ├── go.mod                                 # module scfuture, go 1.22
-├── Makefile                               # build (linux/amd64), deploy, test, clean
+├── Makefile                               # build (linux/amd64) both binaries
 ├── .gitignore                             # bin/, scripts/.ips
 ├── architecture.md                        # this file
+├── schema.sql                             # SQL schema reference (future Postgres migration)
 │
 ├── cmd/
-│   └── machine-agent/
-│       └── main.go                        # entrypoint — env config, discover, serve
+│   ├── machine-agent/
+│   │   └── main.go                        # machine agent entrypoint
+│   └── coordinator/
+│       └── main.go                        # coordinator entrypoint
 │
 ├── internal/
 │   ├── shared/
-│   │   └── types.go                       # 13 API request/response types
-│   └── machineagent/
-│       ├── server.go                      # HTTP routing, handlers, helpers
-│       ├── images.go                      # loop device image management
-│       ├── drbd.go                        # DRBD lifecycle + status parsing
-│       ├── btrfs.go                       # Btrfs format + provisioning
-│       ├── containers.go                  # Docker container lifecycle
-│       ├── state.go                       # in-memory state, discovery
-│       ├── cleanup.go                     # per-user and full-machine teardown
-│       └── exec.go                        # command execution helper
+│   │   └── types.go                       # all API request/response types (31 types)
+│   ├── machineagent/
+│   │   ├── server.go                      # HTTP routing, handlers, system info helpers
+│   │   ├── images.go                      # loop device image management
+│   │   ├── drbd.go                        # DRBD lifecycle + status parsing
+│   │   ├── btrfs.go                       # Btrfs format + provisioning
+│   │   ├── containers.go                  # Docker container lifecycle
+│   │   ├── state.go                       # in-memory state, discovery
+│   │   ├── cleanup.go                     # per-user and full-machine teardown
+│   │   ├── exec.go                        # command execution helper
+│   │   └── heartbeat.go                   # coordinator registration + heartbeat loop
+│   └── coordinator/
+│       ├── server.go                      # HTTP routing, handlers, Coordinator struct
+│       ├── store.go                       # in-memory state store (machines, users, bipods, failover events)
+│       ├── fleet.go                       # fleet register/heartbeat handling
+│       ├── provisioner.go                 # 8-step provisioning state machine
+│       ├── machineapi.go                  # HTTP client for calling machine agents
+│       └── healthcheck.go                 # health checker goroutine + failover logic
 │
 ├── container/
 │   ├── Dockerfile                         # alpine + btrfs-progs, appuser
 │   └── container-init.sh                  # mount subvol, drop to appuser
 │
+├── bin/
+│   ├── machine-agent                      # build output (linux/amd64)
+│   └── coordinator                        # build output (linux/amd64)
+│
 └── scripts/
-    ├── run.sh                             # full orchestration: infra → deploy → test → teardown
-    ├── common.sh                          # shared functions, test framework, API helpers
-    ├── infra.sh                           # Hetzner Cloud infra (up/down/status)
-    ├── deploy.sh                          # scp binary + container files, configure systemd
-    ├── test_suite.sh                      # 66 checks across 9 phases
-    └── cloud-init/
-        └── fleet.yaml                     # cloud-init: DRBD 9, Docker, storage dirs, systemd unit
+    ├── layer-4.1/                         # Layer 4.1 test infrastructure (2 machines)
+    │   ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
+    │   └── cloud-init/fleet.yaml
+    ├── layer-4.2/                         # Layer 4.2 test infrastructure (1 coord + 3 fleet)
+    │   ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
+    │   └── cloud-init/
+    │       ├── coordinator.yaml
+    │       └── fleet.yaml
+    └── layer-4.3/                         # Layer 4.3 test infrastructure (1 coord + 3 fleet)
+        ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
+        └── cloud-init/
+            ├── coordinator.yaml
+            └── fleet.yaml
 ```
 
 ---
 
 ## 3. Package: `internal/shared` — API Types
 
-All types that cross the HTTP boundary live here. Field names and JSON tags are validated by the test suite via `jq`.
+All types that cross the HTTP boundary live here. Used by both machine agent and coordinator.
 
-### `types.go` — 13 type definitions
+### `types.go` — 31 type definitions
 
 ```go
-// ─── Image types ───
-type ImageCreateRequest struct {
-    ImageSizeMB int `json:"image_size_mb"`
-}
+// ─── Machine Agent: Image types ───
+ImageCreateRequest       { ImageSizeMB int }
+ImageCreateResponse      { LoopDevice, ImagePath string; AlreadyExisted bool }
 
-type ImageCreateResponse struct {
-    LoopDevice     string `json:"loop_device"`
-    ImagePath      string `json:"image_path"`
-    AlreadyExisted bool   `json:"already_existed"`
-}
+// ─── Machine Agent: DRBD types ───
+DRBDNode                 { Hostname string; Minor int; Disk, Address string }
+DRBDCreateRequest        { ResourceName string; Nodes []DRBDNode; Port int }
+DRBDCreateResponse       { AlreadyExisted bool }
+DRBDPromoteResponse      { OK, AlreadyExisted bool }
+DRBDDemoteResponse       { OK, AlreadyExisted bool }
+DRBDStatusResponse       { Resource, Role, ConnectionState, DiskState, PeerDiskState string; SyncProgress *string; Exists bool }
 
-// ─── DRBD types ───
-type DRBDNode struct {
-    Hostname string `json:"hostname"`
-    Minor    int    `json:"minor"`
-    Disk     string `json:"disk"`
-    Address  string `json:"address"`
-}
+// ─── Machine Agent: Btrfs types ───
+FormatBtrfsResponse      { AlreadyFormatted bool }
 
-type DRBDCreateRequest struct {
-    ResourceName string     `json:"resource_name"`
-    Nodes        []DRBDNode `json:"nodes"`
-    Port         int        `json:"port"`
-}
+// ─── Machine Agent: Container types ───
+ContainerStartResponse   { ContainerName string; AlreadyExisted bool }
+ContainerStatusResponse  { Exists, Running bool; ContainerName, StartedAt string }
 
-type DRBDCreateResponse struct {
-    AlreadyExisted bool `json:"already_existed"`
-}
+// ─── Machine Agent: Status types ───
+StatusResponse           { MachineID string; DiskTotalMB, DiskUsedMB, RAMTotalMB, RAMUsedMB int64; Users map[string]*UserStatusDTO }
+UserStatusDTO            { ImageExists bool; ImagePath, LoopDevice string; DRBD* fields; HostMounted, ContainerRunning bool; ContainerName string }
 
-type DRBDPromoteResponse struct {
-    OK             bool `json:"ok,omitempty"`
-    AlreadyExisted bool `json:"already_existed,omitempty"`
-}
+// ─── Fleet types (machine agent → coordinator) ───
+FleetRegisterRequest     { MachineID, Address string; DiskTotalMB, DiskUsedMB, RAMTotalMB, RAMUsedMB int64; MaxAgents int }
+FleetHeartbeatRequest    { MachineID string; DiskTotalMB, DiskUsedMB, RAMTotalMB, RAMUsedMB int64; ActiveAgents int; RunningAgents []string }
 
-type DRBDDemoteResponse struct {
-    OK             bool `json:"ok,omitempty"`
-    AlreadyExisted bool `json:"already_existed,omitempty"`
-}
+// ─── Coordinator API types ───
+CreateUserRequest        { UserID string; ImageSizeMB int }
+CreateUserResponse       { UserID, Status string }
+UserDetailResponse       { UserID, Status, PrimaryMachine string; DRBDPort int; Error string; Bipod []BipodEntry }
+BipodEntry               { MachineID, Role string; DRBDMinor int; LoopDevice string }
+FleetStatusResponse      { Machines []MachineStatus }
+MachineStatus            { MachineID, Address, Status string; Disk*, RAM* int64; ActiveAgents, MaxAgents int; RunningAgents []string; LastHeartbeat string }
 
-type DRBDStatusResponse struct {
-    Resource        string  `json:"resource"`
-    Role            string  `json:"role"`
-    ConnectionState string  `json:"connection_state"`
-    DiskState       string  `json:"disk_state"`
-    PeerDiskState   string  `json:"peer_disk_state"`
-    SyncProgress    *string `json:"sync_progress"`
-    Exists          bool    `json:"exists"`
-}
-
-// ─── Btrfs types ───
-type FormatBtrfsResponse struct {
-    AlreadyFormatted bool `json:"already_formatted"`
-}
-
-// ─── Container types ───
-type ContainerStartResponse struct {
-    ContainerName  string `json:"container_name"`
-    AlreadyExisted bool   `json:"already_existed"`
-}
-
-type ContainerStatusResponse struct {
-    Exists        bool   `json:"exists"`
-    Running       bool   `json:"running"`
-    ContainerName string `json:"container_name,omitempty"`
-    StartedAt     string `json:"started_at,omitempty"`
-}
-
-// ─── Status types ───
-type StatusResponse struct {
-    MachineID   string                    `json:"machine_id"`
-    DiskTotalMB int64                     `json:"disk_total_mb"`
-    DiskUsedMB  int64                     `json:"disk_used_mb"`
-    RAMTotalMB  int64                     `json:"ram_total_mb"`
-    RAMUsedMB   int64                     `json:"ram_used_mb"`
-    Users       map[string]*UserStatusDTO `json:"users"`
-}
-
-type UserStatusDTO struct {
-    ImageExists      bool   `json:"image_exists"`
-    ImagePath        string `json:"image_path"`
-    LoopDevice       string `json:"loop_device"`
-    DRBDResource     string `json:"drbd_resource"`
-    DRBDMinor        int    `json:"drbd_minor"`
-    DRBDDevice       string `json:"drbd_device"`
-    DRBDRole         string `json:"drbd_role"`
-    DRBDConnection   string `json:"drbd_connection"`
-    DRBDDiskState    string `json:"drbd_disk_state"`
-    DRBDPeerDisk     string `json:"drbd_peer_disk_state"`
-    HostMounted      bool   `json:"host_mounted"`
-    ContainerRunning bool   `json:"container_running"`
-    ContainerName    string `json:"container_name"`
-}
+// ─── Failover types (coordinator healthcheck) ───
+FailoverEventResponse    { UserID, FromMachine, ToMachine, Type string; Success bool; Error string; DurationMS int64; Timestamp string }
 ```
 
 ---
 
-## 4. Package: `internal/machineagent` — Core Agent
+## 4. Package: `internal/coordinator` — Coordinator
 
-### 4.1 Internal Types (not in shared)
+### 4.1 Coordinator Struct & HTTP Routes (`server.go`)
+
+```go
+type Coordinator struct {
+    store *Store
+}
+
+func NewCoordinator(dataDir string) *Coordinator
+func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux)
+func (coord *Coordinator) GetStore() *Store
+```
+
+**Routes:**
+
+| Method | Path | Handler | Description |
+|--------|------|---------|-------------|
+| `POST` | `/api/fleet/register` | `handleFleetRegister` | Machine agent self-registration |
+| `POST` | `/api/fleet/heartbeat` | `handleFleetHeartbeat` | Machine agent heartbeat |
+| `GET` | `/api/fleet` | `handleFleetStatus` | List all machines with status |
+| `POST` | `/api/users` | `handleCreateUser` | Create user (status: registered) |
+| `GET` | `/api/users` | `handleListUsers` | List all users with bipod details |
+| `GET` | `/api/users/{id}` | `handleGetUser` | Get single user details |
+| `POST` | `/api/users/{id}/provision` | `handleProvisionUser` | Start async provisioning |
+| `GET` | `/api/users/{id}/bipod` | `handleGetBipod` | Get bipod details for user |
+| `GET` | `/api/failovers` | `handleGetFailovers` | List all recorded failover events |
+
+`handleProvisionUser` validates user is in `"registered"` state, sets status to `"provisioning"`, launches `coord.ProvisionUser(userID)` in a goroutine, and returns immediately.
+
+### 4.2 State Store (`store.go`)
+
+```go
+type Store struct {
+    mu             sync.RWMutex
+    machines       map[string]*Machine
+    users          map[string]*User
+    bipods         map[string]*Bipod     // keyed by "{userID}:{machineID}"
+    nextPort       int                   // starts at 7900
+    nextMinor      map[string]int        // per-machine, starts at 0
+    failoverEvents []FailoverEvent
+    dataDir        string
+}
+```
+
+**Machine:**
+```go
+type Machine struct {
+    MachineID, Address, PublicAddress, Status string
+    StatusChangedAt time.Time
+    DiskTotalMB, DiskUsedMB, RAMTotalMB, RAMUsedMB int64
+    ActiveAgents, MaxAgents int
+    RunningAgents []string
+    LastHeartbeat time.Time
+}
+```
+Machine statuses: `"active"` → `"suspect"` (30s no heartbeat) → `"dead"` (60s no heartbeat) → `"active"` (heartbeat resumes).
+
+**User:**
+```go
+type User struct {
+    UserID, Status, PrimaryMachine string
+    DRBDPort, ImageSizeMB int
+    Error string
+    CreatedAt time.Time
+}
+```
+Statuses: `"registered"` → `"provisioning"` → `"running"` or `"failed"`.
+Failover statuses: `"running"` → `"failing_over"` → `"running"` (success) or `"running_degraded"` (partial) or `"unavailable"` (total failure).
+Secondary death: `"running"` → `"running_degraded"`.
+
+**Bipod:**
+```go
+type Bipod struct {
+    UserID, MachineID, Role string  // Role: "primary", "secondary", or "stale"
+    DRBDMinor int
+    LoopDevice string
+}
+```
+
+**FailoverEvent:**
+```go
+type FailoverEvent struct {
+    UserID, FromMachine, ToMachine, Type string  // Type: "primary_failed", "secondary_failed", "both_dead"
+    Success bool
+    Error string
+    DurationMS int64
+    Timestamp time.Time
+}
+```
+
+**Key methods:**
+```go
+// Existing (Layer 4.2)
+func NewStore(dataDir string) *Store
+func (s *Store) RegisterMachine(req *shared.FleetRegisterRequest)
+func (s *Store) UpdateHeartbeat(req *shared.FleetHeartbeatRequest)    // now handles resurrection
+func (s *Store) GetMachine(id string) *Machine
+func (s *Store) AllMachines() []*Machine
+func (s *Store) CreateUser(userID string, imageSizeMB int) (*User, error)
+func (s *Store) GetUser(userID string) *User
+func (s *Store) AllUsers() []*User
+func (s *Store) SetUserStatus(userID, status, errMsg string)
+func (s *Store) SetUserPrimary(userID, machineID string)
+func (s *Store) SetUserPort(userID string, port int)
+func (s *Store) CreateBipod(userID, machineID, role string, minor int)
+func (s *Store) SetBipodLoopDevice(userID, machineID, loopDev string)
+func (s *Store) GetBipods(userID string) []*Bipod
+func (s *Store) AllocatePort() int
+func (s *Store) AllocateMinor(machineID string) int
+func (s *Store) SelectMachines() (primary, secondary *Machine, err error)
+
+// New (Layer 4.3)
+func (s *Store) CheckMachineHealth(suspectThreshold, deadThreshold time.Duration) []string
+func (s *Store) GetUsersOnMachine(machineID string) []string
+func (s *Store) GetSurvivingBipod(userID, deadMachineID string) *Bipod
+func (s *Store) SetBipodRole(userID, machineID, role string)
+func (s *Store) RecordFailoverEvent(event FailoverEvent)
+func (s *Store) GetFailoverEvents() []FailoverEvent
+```
+
+`SelectMachines` holds the write lock, filters active machines with <85% disk usage, sorts by `ActiveAgents` ascending, increments `ActiveAgents` on the selected pair to prevent double-placement.
+
+`CheckMachineHealth` scans all machines, compares `time.Since(LastHeartbeat)` against thresholds, transitions statuses, returns list of machine IDs that just became `"dead"`.
+
+`UpdateHeartbeat` now handles **resurrection**: if a heartbeat arrives from a `"dead"` or `"suspect"` machine, resets status to `"active"` (but does NOT re-integrate bipods — that's Layer 4.4).
+
+`GetSurvivingBipod` returns the bipod NOT on the dead machine, skipping bipods with role `"stale"`.
+
+**Persistence:** `persist()` writes all state (including failover events) as JSON to `{dataDir}/state.json` after every mutation. This is for debugging only — the coordinator does NOT reload from state.json on restart.
+
+### 4.3 Fleet Handling (`fleet.go`)
+
+```go
+func (coord *Coordinator) HandleRegister(req *shared.FleetRegisterRequest)
+func (coord *Coordinator) HandleHeartbeat(req *shared.FleetHeartbeatRequest)
+```
+
+Thin wrappers that delegate to `store.RegisterMachine` and `store.UpdateHeartbeat`.
+
+### 4.4 Provisioner (`provisioner.go`)
+
+```go
+func (coord *Coordinator) ProvisionUser(userID string)
+```
+
+Runs in its own goroutine (launched by `handleProvisionUser`). Drives the full provisioning state machine:
+
+```
+Step 1: SelectMachines() → pick 2 least-loaded
+Step 2: CreateImage on both machines (retry once)
+Step 3: DRBDCreate on both machines (retry once)
+Step 4: DRBDPromote on primary (MUST happen before sync)
+Step 5: Wait for DRBD sync (poll DRBDStatus until PeerDiskState=UpToDate, 120s timeout)
+Step 6: FormatBtrfs on primary (retry once)
+Step 7: ContainerStart on primary (retry once)
+Step 8: SetUserStatus → "running"
+```
+
+Each step uses a `retry` helper that retries once after 2s on failure. On failure after retry, sets user status to `"failed"` with error message.
+
+Helper: `stripPort(address string) string` — extracts IP from `"10.0.0.11:8080"` for DRBD config addresses.
+
+### 4.5 Machine API Client (`machineapi.go`)
+
+```go
+type MachineClient struct {
+    address string          // e.g., "10.0.0.11:8080"
+    client  *http.Client    // 30s timeout
+}
+
+func NewMachineClient(address string) *MachineClient
+
+// Typed wrappers around machine agent endpoints:
+func (c *MachineClient) CreateImage(userID string, sizeMB int) (*shared.ImageCreateResponse, error)
+func (c *MachineClient) DRBDCreate(userID string, req *shared.DRBDCreateRequest) (*shared.DRBDCreateResponse, error)
+func (c *MachineClient) DRBDPromote(userID string) (*shared.DRBDPromoteResponse, error)
+func (c *MachineClient) DRBDDemote(userID string) (*shared.DRBDDemoteResponse, error)
+func (c *MachineClient) DRBDStatus(userID string) (*shared.DRBDStatusResponse, error)
+func (c *MachineClient) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error)
+func (c *MachineClient) ContainerStart(userID string) (*shared.ContainerStartResponse, error)
+func (c *MachineClient) ContainerStop(userID string) error
+func (c *MachineClient) ContainerStatus(userID string) (*shared.ContainerStatusResponse, error)
+func (c *MachineClient) DeleteUser(userID string) error
+func (c *MachineClient) Status() (*shared.StatusResponse, error)
+func (c *MachineClient) Cleanup() error
+
+func (c *MachineClient) doJSON(method, path string, reqBody, respBody interface{}) error
+```
+
+`doJSON` handles marshal/unmarshal, HTTP errors, and non-2xx status codes.
+
+### 4.6 Health Checker & Failover (`healthcheck.go`)
+
+```go
+const (
+    HealthCheckInterval = 10 * time.Second
+    SuspectThreshold    = 30 * time.Second  // 3 missed heartbeats
+    DeadThreshold       = 60 * time.Second  // 6 missed heartbeats
+)
+
+func StartHealthChecker(store *Store, client *MachineClient, coord *Coordinator)
+func (coord *Coordinator) failoverMachine(deadMachineID string)
+func (coord *Coordinator) failoverUser(userID, deadMachineID string)
+```
+
+**StartHealthChecker** launches a background goroutine that ticks every 10 seconds. On each tick, calls `store.CheckMachineHealth()`. For each newly-dead machine, spawns a goroutine calling `failoverMachine()`.
+
+**failoverMachine** gets all users on the dead machine via `GetUsersOnMachine()`, then calls `failoverUser()` for each.
+
+**failoverUser** handles two cases:
+
+1. **Primary died** → Set user `"failing_over"`, mark dead bipod `"stale"`, promote DRBD on surviving machine (`--force`), start container, update bipod roles and primary, set user `"running"`. On promote failure → `"unavailable"`. On container failure → `"running_degraded"`.
+
+2. **Secondary died** → Mark dead bipod `"stale"`, set user `"running_degraded"`. No DRBD or container actions needed.
+
+Each failover records a `FailoverEvent` with timing.
+
+**Concurrency:** Each dead machine's failover runs in its own goroutine. The health checker is never blocked by a slow failover. User failovers within a machine are sequential (simple, avoids race conditions on the same machine's resources).
+
+**Idempotency:** `failoverUser` checks user status before acting — skips if not `"running"` or `"running_degraded"`. DRBD promote with `--force` returns success if already Primary.
+
+---
+
+## 5. Package: `internal/machineagent` — Machine Agent
+
+### 5.1 Internal Types
 
 ```go
 // state.go
@@ -204,13 +400,12 @@ type DRBDInfo struct {
 
 // exec.go
 type CmdResult struct {
-    Stdout   string `json:"stdout,omitempty"`
-    Stderr   string `json:"stderr,omitempty"`
-    ExitCode int    `json:"exit_code"`
+    Stdout, Stderr string
+    ExitCode       int
 }
 ```
 
-### 4.2 Function Signatures by File
+### 5.2 Function Signatures by File
 
 #### `exec.go` — Command Execution
 
@@ -220,99 +415,49 @@ func cmdString(name string, args ...string) string
 func cmdError(msg, command string, result *CmdResult) error
 ```
 
-- `runCmd` wraps `os/exec.Command`, captures stdout/stderr/exit code.
-- `cmdError` formats structured error messages with command, exit code, and stderr.
-
 #### `state.go` — State Management & Discovery
 
 ```go
 func NewAgent(nodeID, dataDir string) *Agent
-
-// Thread-safe user state accessors
 func (a *Agent) getUserLock(userID string) *sync.Mutex
 func (a *Agent) getUser(userID string) *UserResources
 func (a *Agent) setUser(userID string, u *UserResources)
 func (a *Agent) deleteUser(userID string)
-func (a *Agent) allUsers() map[string]*UserResources    // returns deep copy
-
-// Path helpers
+func (a *Agent) allUsers() map[string]*UserResources    // deep copy
 func (a *Agent) imagePath(userID string) string          // {dataDir}/images/{userID}.img
 func (a *Agent) mountPath(userID string) string          // /mnt/users/{userID}
-
-// Discovery — rebuilds in-memory state from system reality
 func (a *Agent) Discover()
-func (a *Agent) ensureUser(userID string) *UserResources // NOT locked — caller must hold usersMu
-
-// Internal discovery helpers (called within Discover, under lock)
-func (a *Agent) discoverLoopDevices()    // parses losetup -a
-func (a *Agent) discoverDRBDConfigs()    // scans /etc/drbd.d/user-*.res
-func (a *Agent) discoverDRBDStatus()     // parses drbdadm status all
-func (a *Agent) discoverMounts()         // parses mount output for /mnt/users/
-func (a *Agent) discoverContainers()     // parses docker ps for *-agent containers
+func (a *Agent) ensureUser(userID string) *UserResources // caller must hold usersMu
 ```
 
-Package-level regex used by discovery and images:
-```go
-var loopRe = regexp.MustCompile(`^(/dev/loop\d+):\s+\[\d+\]:\d+\s+\((.+)\)`)
-var minorRe = regexp.MustCompile(`minor\s+(\d+)`)
-```
+Discovery scans: `losetup -a`, `/etc/drbd.d/user-*.res`, `drbdadm status all`, `mount`, `docker ps`.
 
 #### `images.go` — Disk Image Lifecycle
 
 ```go
-var validUserID = regexp.MustCompile(`^[a-zA-Z0-9-]{3,32}$`)
-
-func validateUserID(userID string) error
+func validateUserID(userID string) error                  // [a-zA-Z0-9-]{3,32}
 func (a *Agent) CreateImage(userID string, sizeMB int) (*shared.ImageCreateResponse, error)
 func (a *Agent) findLoopDevice(imgPath string) string
 func (a *Agent) attachLoop(imgPath string) (string, error)
 ```
 
-**CreateImage behavior:**
-1. Validates user ID (3-32 alphanumeric/hyphen chars)
-2. If image file exists with loop device → return `already_existed: true`
-3. If image file exists without loop device → attach loop, return `already_existed: true`
-4. Otherwise → `truncate -s {size}M`, `losetup -f --show`, update state
-
 #### `drbd.go` — DRBD 9 Lifecycle
 
 ```go
 func (a *Agent) DRBDCreate(userID string, req *shared.DRBDCreateRequest) (*shared.DRBDCreateResponse, error)
-func (a *Agent) DRBDPromote(userID string) (*shared.DRBDPromoteResponse, error)
-func (a *Agent) DRBDDemote(userID string) (*shared.DRBDDemoteResponse, error)
+func (a *Agent) DRBDPromote(userID string) (map[string]interface{}, error)
+func (a *Agent) DRBDDemote(userID string) (map[string]interface{}, error)
 func (a *Agent) DRBDStatus(userID string) (*shared.DRBDStatusResponse, error)
 func (a *Agent) DRBDDestroy(userID string) error
-
 func (a *Agent) getDRBDStatus(resName string) *DRBDInfo
 func parseDRBDStatusAll(output string) map[string]*DRBDInfo
 func splitResourceBlocks(output string) []string
 func isMounted(path string) bool
 ```
 
-**DRBDCreate behavior:**
-1. Validates exactly 2 nodes in request
-2. If `drbdadm status {resName}` succeeds → already exists
-3. Writes config to `/etc/drbd.d/{resName}.res` (Protocol A, internal meta-disk)
-4. `drbdadm create-md --force {resName}` → `drbdadm up {resName}`
-5. Matches local hostname to set DRBDMinor and DRBDDevice in state
+**DRBDPromote** uses `drbdadm primary --force {resName}`. The `--force` flag allows promotion without a connected peer (needed for initial setup and failover).
 
-**DRBD config template (written to `/etc/drbd.d/{resName}.res`):**
-```
-resource {resName} {
-    net { protocol A; max-buffers 8000; max-epoch-size 8000; sndbuf-size 0; rcvbuf-size 0; }
-    disk { on-io-error detach; }
-    on {node0.Hostname} { device /dev/drbd{minor} minor {minor}; disk {disk}; address {addr}:{port}; meta-disk internal; }
-    on {node1.Hostname} { device /dev/drbd{minor} minor {minor}; disk {disk}; address {addr}:{port}; meta-disk internal; }
-}
-```
-
-**DRBDPromote:** checks role, skips if already Primary. Runs `drbdadm primary --force {resName}`.
-
-**DRBDDemote:** checks role, skips if already Secondary. Unmounts host mount if present before demoting. Runs `drbdadm secondary {resName}`.
-
-**parseDRBDStatusAll:** Parses multi-resource `drbdadm status` output. Handles Connected, Syncing, Disconnected, and StandAlone states. Extracts role, disk state, peer disk state, connection state, and sync progress from key:value tokens.
-
-**Resource naming convention:** `user-{userID}` (e.g., `user-alice`).
+**DRBD config:** Protocol A, internal meta-disk, resource name `user-{userID}`.
 
 #### `btrfs.go` — Filesystem Provisioning
 
@@ -320,14 +465,7 @@ resource {resName} {
 func (a *Agent) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error)
 ```
 
-**FormatBtrfs behavior:**
-1. Requires DRBD device in state
-2. Tries `mount -t btrfs {drbdDev} {mountPath}` — if workspace subvol exists → already formatted
-3. Formats: `mkfs.btrfs -f {drbdDev}`
-4. Mounts, creates subvolume `workspace` with seed directories: `memory/`, `apps/`, `data/`
-5. Writes `data/config.json` with `{"created": "...", "user": "..."}`
-6. Creates `snapshots/` dir and read-only snapshot `snapshots/layer-000`
-7. **Unmounts** — host does NOT keep Btrfs mounted (device-mount pattern)
+Formats DRBD device, creates `workspace/` subvol with seed dirs (`memory/`, `apps/`, `data/`), writes `data/config.json`, creates `snapshots/layer-000`, then **unmounts** (host does NOT keep Btrfs mounted).
 
 #### `containers.go` — Docker Container Lifecycle
 
@@ -335,100 +473,30 @@ func (a *Agent) FormatBtrfs(userID string) (*shared.FormatBtrfsResponse, error)
 func (a *Agent) ContainerStart(userID string) (*shared.ContainerStartResponse, error)
 func (a *Agent) ContainerStop(userID string) error
 func (a *Agent) ContainerStatus(userID string) (*shared.ContainerStatusResponse, error)
-
-func (a *Agent) isContainerRunning(name string) bool
-func (a *Agent) containerExists(name string) bool
 ```
 
-**Container naming convention:** `{userID}-agent` (e.g., `alice-agent`).
-
-**ContainerStart docker run flags (security-critical — do not modify):**
-```
-docker run -d
-    --name {userID}-agent
-    --device {drbdDev}
-    --cap-drop ALL
-    --cap-add SYS_ADMIN
-    --cap-add SETUID
-    --cap-add SETGID
-    --security-opt apparmor=unconfined
-    --network none
-    --memory 64m
-    -e BLOCK_DEVICE={drbdDev}
-    -e SUBVOL_NAME=workspace
-    platform/app-container
-```
-
-Waits 2 seconds after start, verifies running, fetches logs on failure.
-
-#### `server.go` — HTTP API
-
-```go
-func (a *Agent) RegisterRoutes(mux *http.ServeMux)
-func (a *Agent) EnsureContainerImage() error
-
-// Handlers (all private)
-func (a *Agent) handleStatus(w, r)
-func (a *Agent) handleImageCreate(w, r)
-func (a *Agent) handleImageDelete(w, r)
-func (a *Agent) handleDRBDCreate(w, r)
-func (a *Agent) handleDRBDPromote(w, r)
-func (a *Agent) handleDRBDDemote(w, r)
-func (a *Agent) handleDRBDStatus(w, r)
-func (a *Agent) handleDRBDDestroy(w, r)
-func (a *Agent) handleFormatBtrfs(w, r)
-func (a *Agent) handleContainerStart(w, r)
-func (a *Agent) handleContainerStop(w, r)
-func (a *Agent) handleContainerStatus(w, r)
-func (a *Agent) handleCleanup(w, r)
-
-// Helpers
-func writeJSON(w http.ResponseWriter, status int, v interface{})
-func writeError(w http.ResponseWriter, status int, errMsg, details string)
-func getDiskTotalMB() int64
-func getDiskUsedMB() int64
-func parseDfMB(output string) int64
-func getRAMTotalMB() int64
-func getRAMUsedMB() int64
-func parseMemInfoKB(content, key string) int64
-```
-
-**EnsureContainerImage:** checks `docker images platform/app-container`, builds from `/opt/platform/container/` if missing.
+Container name: `{userID}-agent`. Docker run flags: `--device {drbdDev}`, `--cap-drop ALL`, `--cap-add SYS_ADMIN,SETUID,SETGID`, `--security-opt apparmor=unconfined`, `--network none`, `--memory 64m`.
 
 #### `cleanup.go` — Teardown
 
 ```go
-func (a *Agent) DeleteUser(userID string) error
-func (a *Agent) Cleanup() error
+func (a *Agent) DeleteUser(userID string) error   // reverse-order teardown of one user
+func (a *Agent) Cleanup() error                   // tear down ALL users on the machine
 ```
 
-**DeleteUser** tears down in reverse order:
-1. `docker stop` + `docker rm -f` container
-2. `umount` if mounted
-3. `drbdadm down` resource
-4. Remove `/etc/drbd.d/{resName}.res`
-5. `losetup -d` loop device
-6. Remove image file
-7. Remove mount directory
-8. Clear in-memory state and per-user lock
+#### `heartbeat.go` — Coordinator Registration & Heartbeat
 
-**Cleanup** tears down ALL users:
-1. Stop all `*-agent` containers
-2. Unmount all `/mnt/users/*`
-3. `drbdadm down` all `user-*` resources
-4. Remove all DRBD configs
-5. Detach all loop devices for `{dataDir}/images/`
-6. Remove all image files
-7. Remove all mount dirs
-8. Reset in-memory state and locks map
+```go
+func (a *Agent) StartHeartbeat(coordinatorURL, nodeAddress string)
+```
 
----
+Runs in a goroutine. Registers with coordinator (retries every 5s until success), then sends heartbeats every 10s with disk/RAM metrics and running agent list. Called from `main.go` only if `COORDINATOR_URL` env var is set.
 
-## 5. HTTP API Reference
+#### `server.go` — HTTP API
 
-All endpoints listen on `{LISTEN_ADDR}` (default `0.0.0.0:8080`).
-All responses are `Content-Type: application/json`.
-Errors return `{"error": "...", "details": "..."}`.
+13 endpoints. See API Reference below.
+
+### 5.3 Machine Agent HTTP API
 
 | Method | Path | Request Body | Response | Locked |
 |--------|------|-------------|----------|--------|
@@ -446,150 +514,226 @@ Errors return `{"error": "...", "details": "..."}`.
 | `GET` | `/containers/{user_id}/status` | — | `ContainerStatusResponse` | No |
 | `POST` | `/cleanup` | — | `{"ok": true}` | No |
 
-**Locking:** "Yes" means the handler acquires `getUserLock(userID)` before proceeding. Different user IDs do not block each other.
-
 ---
 
-## 6. Entrypoint: `cmd/machine-agent/main.go`
+## 6. Entrypoints
 
-```go
-func main()
-```
+### `cmd/coordinator/main.go`
 
-1. Configures JSON structured logging (`slog.NewJSONHandler`)
-2. Reads env vars: `NODE_ID` (required), `LISTEN_ADDR` (default `0.0.0.0:8080`), `DATA_DIR` (default `/data`)
-3. Creates `Agent` via `NewAgent(nodeID, dataDir)`
-4. Calls `agent.Discover()` to rebuild state from system
-5. Calls `agent.EnsureContainerImage()` (warns on failure — may not be deployed yet)
-6. Registers routes on `http.NewServeMux()`
-7. Starts `http.ListenAndServe`
+1. JSON structured logging
+2. Reads env: `LISTEN_ADDR` (default `0.0.0.0:8080`), `DATA_DIR` (default `/data`)
+3. Creates `Coordinator` via `NewCoordinator(dataDir)`
+4. Starts health checker goroutine via `StartHealthChecker(coord.GetStore(), ...)`
+5. Registers routes, starts `http.ListenAndServe`
+
+### `cmd/machine-agent/main.go`
+
+1. JSON structured logging
+2. Reads env: `NODE_ID` (required), `LISTEN_ADDR`, `DATA_DIR`, `NODE_ADDRESS`, `COORDINATOR_URL`
+3. Creates `Agent`, calls `Discover()` and `EnsureContainerImage()`
+4. Registers routes
+5. If `COORDINATOR_URL` set → starts heartbeat goroutine with `NODE_ADDRESS`
+6. Starts `http.ListenAndServe`
 
 ---
 
 ## 7. Container Image: `platform/app-container`
 
-**Dockerfile:**
-- Base: `alpine:latest`
-- Installs: `btrfs-progs`
-- Creates unprivileged user: `appuser`
-- Entrypoint: `/usr/local/bin/container-init.sh`
+**Dockerfile:** alpine + btrfs-progs, creates `appuser`, entrypoint: `container-init.sh`
 
-**container-init.sh:**
-1. `mkdir -p /workspace`
-2. `mount -t btrfs -o subvol="$SUBVOL_NAME" "$BLOCK_DEVICE" /workspace`
-3. `exec su appuser -s /bin/sh -c "${WORKLOAD_CMD:-"while true; do sleep 60; done"}"`
-
-After `exec`, the process replaces init — SYS_ADMIN, SETUID, SETGID caps are dropped. The container runs as `appuser` with only the workspace subvolume visible.
+**container-init.sh:** mount Btrfs subvol → `exec su appuser` (drops all capabilities)
 
 ---
 
 ## 8. Infrastructure & Deployment
 
-### Target Environment
-- 2x Hetzner Cloud servers (`cx23`, Ubuntu 24.04, `nbg1`)
-- Private network: `10.0.0.0/24` (DRBD replication traffic)
-- Cloud-init installs: DRBD 9 (LINBIT PPA), Docker, btrfs-progs, curl, jq
+### Layer 4.3 Topology
 
-### Deployment Flow (`scripts/deploy.sh`)
-For each machine:
-1. `scp` binary to `/usr/local/bin/machine-agent`
-2. `scp` Dockerfile + container-init.sh to `/opt/platform/container/`
-3. Set `NODE_ID` in systemd unit, set hostname
-4. `docker build -t platform/app-container` on the machine
+- 1x coordinator (`l43-coordinator`, private `10.0.0.2`)
+- 3x fleet machines (`l43-fleet-{1,2,3}`, private `10.0.0.{11,12,13}`)
+- All Hetzner Cloud `cx23`, Ubuntu 24.04, private network `10.0.0.0/24`
+- Same topology as Layer 4.2 (with `l43-` prefix)
 
-### Systemd Unit (created by cloud-init)
+### Deployment Flow (`scripts/layer-4.3/deploy.sh`)
+
+**Coordinator:**
+1. Wait for SSH + cloud-init
+2. `scp` coordinator binary to `/usr/local/bin/coordinator`
+3. Set hostname, `systemctl start coordinator`
+
+**Fleet machines (each):**
+1. Wait for SSH + cloud-init
+2. `scp` machine-agent binary + container files
+3. Set hostname, configure systemd with `NODE_ID`, `NODE_ADDRESS`, `COORDINATOR_URL`
+4. Build `platform/app-container` image, verify DRBD module, start machine-agent
+
+### Systemd Units
+
+**Coordinator:**
 ```ini
-[Service]
-Type=simple
+ExecStart=/usr/local/bin/coordinator
+Environment=LISTEN_ADDR=0.0.0.0:8080
+Environment=DATA_DIR=/data
+```
+
+**Machine Agent:**
+```ini
 ExecStart=/usr/local/bin/machine-agent
 Environment=NODE_ID={node-id}
 Environment=LISTEN_ADDR=0.0.0.0:8080
 Environment=DATA_DIR=/data
-Restart=on-failure
-RestartSec=5
+Environment=NODE_ADDRESS={private-ip}:8080
+Environment=COORDINATOR_URL=http://10.0.0.2:8080
 ```
 
-### Storage Layout on Each Machine
+### Storage Layout (each fleet machine)
+
 ```
-/data/images/{userID}.img          # sparse disk image files
-/mnt/users/{userID}/               # temporary mount point (used only during format)
+/data/images/{userID}.img          # sparse disk images
+/mnt/users/{userID}/               # temporary mount point (format only)
 /etc/drbd.d/user-{userID}.res     # DRBD config files
 /opt/platform/container/           # Dockerfile + container-init.sh
-/usr/local/bin/machine-agent       # the agent binary
+/usr/local/bin/machine-agent       # agent binary
+```
+
+### Storage Layout (coordinator)
+
+```
+/data/state.json                   # JSON state dump (debug only)
+/usr/local/bin/coordinator         # coordinator binary
 ```
 
 ---
 
-## 9. Test Suite Summary
+## 9. Provisioning Flow
 
-The test suite (`scripts/test_suite.sh`) runs 66 checks across 9 phases:
+### Full Stack (coordinator-driven)
 
-| Phase | Name | Checks | What It Validates |
-|-------|------|--------|-------------------|
-| 0 | Prerequisites | 8 | SSH, DRBD module, agent responding, container image |
-| 1 | Single User Provisioning | 10 | Image creation, DRBD setup, sync, format, container start |
-| 2 | Device-Mount Verification | 5 | /workspace mount, seed data, appuser, no host paths in /proc/mounts |
-| 3 | Data Write + Replication | 4 | Write data in container, DRBD connected, peer UpToDate |
-| 4 | Failover via API | 8 | Stop → demote → promote → start on other machine, data survives |
-| 5 | Idempotency | 8 | Repeat every operation, all return 200 with appropriate flags |
-| 6 | Full Teardown | 8 | DELETE user, verify no images/loops/DRBD/containers on both machines |
-| 7 | Multi-User Density | 10 | 3 users (alice/bob/charlie) on same bipod, data isolation, independence |
-| 8 | Status Endpoint | 5 | Accurate container/DRBD state, cleanup empties status |
+```
+POST /api/users {"user_id":"alice"}          → creates user (registered)
+POST /api/users/alice/provision              → launches async provisioning
+  ↓ (goroutine)
+  Step 1: SelectMachines() → fleet-1 (primary), fleet-2 (secondary)
+  Step 2: POST /images/alice/create          → both machines (get loop devices)
+  Step 3: POST /images/alice/drbd/create     → both machines (with DRBD config)
+  Step 4: POST /images/alice/drbd/promote    → primary only (BEFORE sync)
+  Step 5: Poll GET /images/alice/drbd/status → wait for PeerDiskState=UpToDate
+  Step 6: POST /images/alice/format-btrfs    → primary only
+  Step 7: POST /containers/alice/start       → primary only
+  Step 8: SetUserStatus("running")
+```
 
-### Test Helpers (from `common.sh`)
+### Automatic Failover (Layer 4.3 — coordinator-driven)
+
+```
+Health checker detects machine heartbeat timeout (60s)
+  ↓ (goroutine per dead machine)
+  For each user with bipod on dead machine:
+    Case 1: Primary died
+      → Set user "failing_over"
+      → Mark dead bipod "stale"
+      → POST /images/{user}/drbd/promote  → surviving machine (--force)
+      → POST /containers/{user}/start     → surviving machine
+      → Update bipod roles, user primary
+      → Set user "running"
+    Case 2: Secondary died
+      → Mark dead bipod "stale"
+      → Set user "running_degraded"
+```
+
+### Manual Failover (Layer 4.1 pattern, still works)
+
+```
+POST /containers/{user}/stop      → current primary
+POST /images/{user}/drbd/demote   → current primary
+POST /images/{user}/drbd/promote  → new primary
+POST /containers/{user}/start     → new primary
+```
+
+---
+
+## 10. Test Suites
+
+### Layer 4.1 — Machine Agent (66 checks, 9 phases)
+
+Tests machine agent directly (no coordinator). 2 Hetzner servers.
+
+| Phase | Checks | What |
+|-------|--------|------|
+| 0 | 8 | Prerequisites |
+| 1 | 10 | Single user provisioning (full stack) |
+| 2 | 5 | Device-mount verification |
+| 3 | 4 | Data write + DRBD replication |
+| 4 | 8 | Manual failover via API |
+| 5 | 8 | Idempotency |
+| 6 | 8 | Full teardown |
+| 7 | 10 | Multi-user density (3 users) |
+| 8 | 5 | Status endpoint accuracy |
+
+### Layer 4.2 — Coordinator Happy Path (55 checks, 8 phases)
+
+Tests coordinator-driven provisioning. 4 Hetzner servers (1 coord + 3 fleet).
+
+| Phase | Checks | What |
+|-------|--------|------|
+| 0 | 11 | Prerequisites (coordinator, 3 machines, DRBD, images) |
+| 1 | 8 | Provision first user (alice) — full verification |
+| 2 | 4 | Provision second user (bob) — placement diversity |
+| 3 | 2 | Provision third user (charlie) |
+| 4 | 5 | Provision dave and eve — 5 users total |
+| 5 | 9 | Fleet status — balanced placement, consistency |
+| 6 | 5 | Data isolation — unique writes, DRBD health |
+| 7 | 6 | Cleanup — all machines clean |
+
+### Layer 4.3 — Heartbeat Failure Detection & Failover (62 checks, 9 phases)
+
+Tests automatic failure detection and failover. 4 Hetzner servers (1 coord + 3 fleet). Kills fleet-1 mid-test.
+
+| Phase | Checks | What |
+|-------|--------|------|
+| 0 | 13 | Prerequisites (coordinator, 3 machines, DRBD, images, no failover events) |
+| 1 | 12 | Provision 3 users, write test data, verify DRBD healthy |
+| 2 | 2 | Kill fleet-1 via `hcloud server shutdown` |
+| 3 | 3 | Wait for coordinator to detect fleet-1 as dead |
+| 4 | 8 | Verify automatic failover (DRBD promote, container start, events) |
+| 5 | 9 | Data integrity — pre-failover data survived, new writes work |
+| 6 | 5 | Degraded state — secondary loss handled, bipod roles correct |
+| 7 | 6 | State consistency — fleet status, no stale primaries, valid states |
+| 8 | 4 | Cleanup surviving machines |
+
+### Test Helpers (`common.sh`)
+
 ```bash
-api "$ip" METHOD /path [body]        # curl wrapper to agent API
-ssh_cmd "$ip" "command"              # SSH to machine as root
-docker_exec "$ip" container cmd      # docker exec inside container via SSH
-check "description" 'test_command'   # assertion framework with counters
-phase_start N "Name"                 # reset phase counters
-phase_result                         # print phase summary
-final_result                         # print total summary, exit 1 if any failed
-```
-
----
-
-## 10. Provisioning Sequence (Full Stack for One User)
-
-This is the sequence an external caller must follow to provision a user across the bipod:
-
-```
-1. POST /images/{user}/create  {"image_size_mb": 512}     → both machines
-2. POST /images/{user}/drbd/create  {config with both nodes}  → both machines
-3. POST /images/{user}/drbd/promote                         → primary machine only
-4. (wait for DRBD sync — poll GET /images/{user}/drbd/status until peer_disk_state=UpToDate)
-5. POST /images/{user}/format-btrfs                         → primary machine only
-6. POST /containers/{user}/start                            → primary machine only
-```
-
-### Failover Sequence
-
-```
-1. POST /containers/{user}/stop     → current primary
-2. POST /images/{user}/drbd/demote  → current primary
-3. POST /images/{user}/drbd/promote → new primary
-4. POST /containers/{user}/start    → new primary
-```
-
-### Teardown Sequence
-
-```
-1. DELETE /images/{user}            → both machines
-   (or POST /cleanup for full machine reset)
+coord_api METHOD /path [body]                    # curl to coordinator via public IP
+machine_api $ip METHOD /path [body]              # curl to machine agent via public IP
+ssh_cmd $ip "command"                            # SSH as root
+docker_exec $ip container cmd                    # docker exec via SSH
+check "description" 'test_command'               # assertion with counters
+wait_for_user_status user_id status timeout      # poll coordinator until user reaches status
+wait_for_machine_status machine_id status timeout # poll coordinator until machine reaches status
+get_public_ip machine_id                         # map fleet-N → public IP
+phase_start/phase_result/final_result            # test framework
 ```
 
 ---
 
 ## 11. Conventions & Constraints
 
-- **User ID format:** 3-32 chars, `[a-zA-Z0-9-]` only (validated by `validateUserID`)
-- **Resource naming:** DRBD resource = `user-{userID}`, container = `{userID}-agent`
-- **DRBD port convention:** starts at 7900, incremented per user (7900, 7901, 7902...)
-- **DRBD minor convention:** starts at 0, incremented per user (0, 1, 2...)
-- **Image path:** `{dataDir}/images/{userID}.img`
-- **Mount path:** `/mnt/users/{userID}` (temporary, only used during Btrfs format)
-- **DRBD config path:** `/etc/drbd.d/user-{userID}.res`
-- **Container image:** `platform/app-container` (built from `/opt/platform/container/`)
-- **Btrfs layout inside device:** `workspace/` subvol (with `memory/`, `apps/`, `data/`), `snapshots/layer-000`
-- **No host-level Btrfs mounts at runtime** — only during format, then unmounted
+- **User ID format:** 3-32 chars, `[a-zA-Z0-9-]` only
+- **DRBD resource name:** `user-{userID}`
+- **Container name:** `{userID}-agent`
+- **DRBD port:** sequential from 7900
+- **DRBD minor:** sequential per-machine from 0
+- **Image path:** `/data/images/{userID}.img`
+- **DRBD config:** `/etc/drbd.d/user-{userID}.res`
+- **Private network:** `10.0.0.0/24` — coordinator at `.2`, fleet at `.11-.13`
+- **No host-level Btrfs mounts at runtime**
 - **Build target:** `GOOS=linux GOARCH=amd64`
+- **DRBD promote-before-sync** — always promote primary before waiting for sync
+- **Protocol A** — async replication, last few seconds of writes may be lost on failover
+- **Machine statuses:** `active` → `suspect` (30s) → `dead` (60s) → `active` (resurrection)
+- **User statuses:** `registered` → `provisioning` → `running` / `failed` / `failing_over` / `running_degraded` / `unavailable`
+- **Bipod roles:** `primary`, `secondary`, `stale` (machine dead, bipod no longer valid)
+- **Failover is idempotent** — skips users not in `running` or `running_degraded`
+- **Failover does not block health checker** — each dead machine gets its own goroutine
+- **Resurrection does not auto-integrate** — dead machine returning to `active` does not touch bipods (Layer 4.4)

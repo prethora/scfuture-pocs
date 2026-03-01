@@ -30,6 +30,21 @@ func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/users/{id}", coord.handleGetUser)
 	mux.HandleFunc("POST /api/users/{id}/provision", coord.handleProvisionUser)
 	mux.HandleFunc("GET /api/users/{id}/bipod", coord.handleGetBipod)
+
+	// Failover events
+	mux.HandleFunc("GET /api/failovers", coord.handleGetFailovers)
+}
+
+func (coord *Coordinator) GetStore() *Store {
+	return coord.store
+}
+
+func (coord *Coordinator) handleGetFailovers(w http.ResponseWriter, r *http.Request) {
+	events := coord.store.GetFailoverEvents()
+	if events == nil {
+		events = []FailoverEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 func (coord *Coordinator) handleFleetRegister(w http.ResponseWriter, r *http.Request) {
