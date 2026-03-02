@@ -238,6 +238,7 @@ func (coord *Coordinator) reformUser(userID string) {
 		Nodes: drbdReq.Nodes,
 		Port:  drbdReq.Port,
 		Force: false,
+		Role:  "primary",
 	}
 
 	var reconfigMethod string
@@ -335,7 +336,7 @@ func (coord *Coordinator) reformUser(userID string) {
 
 	// ── Step 8: Update state ──
 	coord.store.SetUserStatus(userID, "running", "")
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 
 	coord.store.RecordReformationEvent(ReformationEvent{
 		UserID:       userID,

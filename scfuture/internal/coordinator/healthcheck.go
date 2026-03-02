@@ -65,6 +65,13 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 		return
 	}
 
+	// Handle migrating users — mark bipod stale only, reconciler handles recovery
+	if user.Status == "migrating" {
+		logger.Info("User is migrating — marking bipod stale only, reconciler will handle", "status", user.Status)
+		coord.store.SetBipodRole(userID, deadMachineID, "stale")
+		return
+	}
+
 	// Skip if user is not in a state that needs failover
 	if user.Status != "running" && user.Status != "running_degraded" {
 		logger.Info("Skipping user — not in running state", "status", user.Status)
@@ -179,7 +186,7 @@ func (coord *Coordinator) failoverUser(userID, deadMachineID string) {
 	coord.store.SetBipodRole(userID, survivingBipod.MachineID, "primary")
 	coord.store.SetUserPrimary(userID, survivingBipod.MachineID)
 	coord.store.SetUserStatus(userID, "running_degraded", "primary failed over from "+deadMachineID)
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 
 	coord.store.RecordFailoverEvent(FailoverEvent{
 		UserID:      userID,

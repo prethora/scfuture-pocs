@@ -42,13 +42,23 @@ type DRBDDemoteResponse struct {
 }
 
 type DRBDStatusResponse struct {
-	Resource        string  `json:"resource"`
-	Role            string  `json:"role"`
-	ConnectionState string  `json:"connection_state"`
-	DiskState       string  `json:"disk_state"`
-	PeerDiskState   string  `json:"peer_disk_state"`
-	SyncProgress    *string `json:"sync_progress"`
-	Exists          bool    `json:"exists"`
+	Resource        string         `json:"resource"`
+	Role            string         `json:"role"`
+	ConnectionState string         `json:"connection_state"`
+	DiskState       string         `json:"disk_state"`
+	PeerDiskState   string         `json:"peer_disk_state"`   // worst-case across all peers (backward compat)
+	SyncProgress    *string        `json:"sync_progress"`     // progress of any syncing peer (backward compat)
+	Peers           []DRBDPeerInfo `json:"peers,omitempty"`   // per-peer details (Layer 5.1)
+	Exists          bool           `json:"exists"`
+}
+
+// ─── DRBD peer info for multi-peer status (Layer 5.1) ───
+
+type DRBDPeerInfo struct {
+	Hostname     string  `json:"hostname"`
+	Role         string  `json:"role"`
+	DiskState    string  `json:"disk_state"`
+	SyncProgress *string `json:"sync_progress,omitempty"`
 }
 
 // ─── Btrfs types (from btrfs.go) ───
@@ -165,6 +175,7 @@ type DRBDReconfigureRequest struct {
 	Nodes []DRBDNode `json:"nodes"`
 	Port  int        `json:"port"`
 	Force bool       `json:"force"` // false=adjust only, true=down/up/promote
+	Role  string     `json:"role"`  // "primary" or "secondary" — used by force path to decide promotion
 }
 
 type DRBDReconfigureResponse struct {
@@ -275,4 +286,28 @@ type UserStatusDTO struct {
 	HostMounted      bool   `json:"host_mounted"`
 	ContainerRunning bool   `json:"container_running"`
 	ContainerName    string `json:"container_name"`
+}
+
+// ─── Migration types (Layer 5.1) ───
+
+type MigrateUserRequest struct {
+	SourceMachine string `json:"source_machine"`
+	TargetMachine string `json:"target_machine"`
+}
+
+type MigrateUserResponse struct {
+	UserID string `json:"user_id"`
+	Status string `json:"status"`
+}
+
+type MigrationEventResponse struct {
+	UserID        string `json:"user_id"`
+	SourceMachine string `json:"source_machine"`
+	TargetMachine string `json:"target_machine"`
+	MigrationType string `json:"migration_type"` // "primary" or "secondary"
+	Success       bool   `json:"success"`
+	Error         string `json:"error,omitempty"`
+	Method        string `json:"method,omitempty"` // "adjust" or "down_up"
+	DurationMS    int64  `json:"duration_ms"`
+	Timestamp     string `json:"timestamp"`
 }

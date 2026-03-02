@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"scfuture/internal/shared"
 )
 
 // Reconcile runs the five-phase startup reconciliation algorithm.
@@ -25,10 +27,16 @@ func (coord *Coordinator) Reconcile() {
 	// Phase 3b: Clean up orphans
 	coord.reconcilePhase3bCleanOrphans(logger, orphans)
 
+	// Phase 3c: Clean up stale tripod bipods — running users should have exactly 2 non-stale bipods
+	coord.reconcilePhase3cCleanStaleTripods(logger, machineStatuses)
+
 	// Phase 4: Handle offline machines (failover for running users on dead machines)
 	coord.reconcilePhase4HandleOffline(logger)
 
-	// Phase 5: Log completion
+	// Phase 5: Ensure running users have containers on their primary machine
+	coord.reconcilePhase5EnsureContainers(logger, machineStatuses)
+
+	// Phase 6: Log completion
 	logger.Info("Reconciliation complete",
 		"duration_ms", time.Since(start).Milliseconds(),
 		"operations_resumed", resumed,
@@ -270,6 +278,8 @@ func (coord *Coordinator) reconcilePhase3ResumeOperations(logger *slog.Logger, m
 			coord.resumeColdReactivation(op, machineStatuses)
 		case "eviction":
 			coord.resumeEviction(op, machineStatuses)
+		case "live_migration":
+			coord.resumeMigration(op, machineStatuses)
 		default:
 			logger.Warn("[Phase 3] Unknown operation type — cancelling", "type", op.Type)
 			coord.store.CancelOperation(op.OperationID)
@@ -277,7 +287,7 @@ func (coord *Coordinator) reconcilePhase3ResumeOperations(logger *slog.Logger, m
 		resumed++
 	}
 
-	// Handle users stuck in "provisioning" with no operation row
+	// Handle users stuck in "provisioning" or "migrating" with no operation row
 	users := coord.store.AllUsers()
 	for _, u := range users {
 		if u.Status == "provisioning" {
@@ -294,6 +304,22 @@ func (coord *Coordinator) reconcilePhase3ResumeOperations(logger *slog.Logger, m
 				logger.Info("[Phase 3] User stuck in provisioning with no operation — marking failed",
 					"user_id", u.UserID)
 				coord.store.SetUserStatus(u.UserID, "failed", "coordinator crashed before operation created")
+			}
+		}
+		if u.Status == "migrating" {
+			// Check if there's a migration operation for this user
+			ops, _ := coord.store.GetIncompleteOperations()
+			hasOp := false
+			for _, op := range ops {
+				if op.UserID == u.UserID && op.Type == "live_migration" {
+					hasOp = true
+					break
+				}
+			}
+			if !hasOp {
+				logger.Info("[Phase 3] User stuck in migrating with no operation — reverting to running",
+					"user_id", u.UserID)
+				coord.store.SetUserStatus(u.UserID, "running", "coordinator crashed before migration operation created")
 			}
 		}
 	}
@@ -324,7 +350,7 @@ func (coord *Coordinator) resumeProvision(op *Operation, machineStatuses map[str
 		if info, ok := pm.Users[op.UserID]; ok && info.ContainerRunning {
 			logger.Info("Container already running — completing provision")
 			coord.store.SetUserStatus(op.UserID, "running", "")
-			coord.store.CompleteOperation(op.OperationID)
+			_ = coord.store.CompleteOperation(op.OperationID)
 			return
 		}
 	}
@@ -357,7 +383,7 @@ func (coord *Coordinator) resumeFailover(op *Operation, machineStatuses map[stri
 		coord.store.SetBipodRole(op.UserID, survivingMachine, "primary")
 		coord.store.SetUserPrimary(op.UserID, survivingMachine)
 		coord.store.SetUserStatus(op.UserID, "running_degraded", "recovered after crash")
-		coord.store.CompleteOperation(op.OperationID)
+		_ = coord.store.CompleteOperation(op.OperationID)
 		return
 	}
 
@@ -390,7 +416,7 @@ func (coord *Coordinator) resumeFailover(op *Operation, machineStatuses map[stri
 		coord.store.SetBipodRole(op.UserID, survivingMachine, "primary")
 		coord.store.SetUserPrimary(op.UserID, survivingMachine)
 		coord.store.SetUserStatus(op.UserID, "running_degraded", "recovered after crash")
-		coord.store.CompleteOperation(op.OperationID)
+		_ = coord.store.CompleteOperation(op.OperationID)
 	default:
 		logger.Warn("Unknown failover step — marking failed", "step", op.CurrentStep)
 		coord.store.SetUserStatus(op.UserID, "unavailable", "unknown step during recovery: "+op.CurrentStep)
@@ -425,7 +451,7 @@ func (coord *Coordinator) resumeSuspension(op *Operation, machineStatuses map[st
 				logger.Info("Container stopped, completing suspension")
 				coord.store.SetUserStatus(op.UserID, "suspended", "")
 				coord.store.SetUserDRBDDisconnected(op.UserID, false)
-				coord.store.CompleteOperation(op.OperationID)
+				_ = coord.store.CompleteOperation(op.OperationID)
 				return
 			}
 		}
@@ -462,7 +488,7 @@ func (coord *Coordinator) resumeWarmReactivation(op *Operation, machineStatuses 
 			coord.store.SetBipodRole(op.UserID, primaryMachine, "primary")
 			coord.store.SetUserStatus(op.UserID, "running", "")
 			coord.store.SetUserDRBDDisconnected(op.UserID, false)
-			coord.store.CompleteOperation(op.OperationID)
+			_ = coord.store.CompleteOperation(op.OperationID)
 			return
 		}
 	}
@@ -487,7 +513,7 @@ func (coord *Coordinator) resumeColdReactivation(op *Operation, machineStatuses 
 				logger.Info("Container already running — completing cold reactivation")
 				coord.store.SetUserStatus(op.UserID, "running", "")
 				coord.store.SetUserDRBDDisconnected(op.UserID, false)
-				coord.store.CompleteOperation(op.OperationID)
+				_ = coord.store.CompleteOperation(op.OperationID)
 				return
 			}
 		}
@@ -527,7 +553,7 @@ func (coord *Coordinator) resumeEviction(op *Operation, machineStatuses map[stri
 		coord.store.ClearUserBipods(op.UserID)
 		coord.store.SetUserStatus(op.UserID, "evicted", "")
 		coord.store.SetUserDRBDDisconnected(op.UserID, false)
-		coord.store.CompleteOperation(op.OperationID)
+		_ = coord.store.CompleteOperation(op.OperationID)
 	case "evict-backup-verified":
 		// Need to clean resources — retry the cleanup
 		logger.Info("Backup verified — cleaning resources")
@@ -545,12 +571,284 @@ func (coord *Coordinator) resumeEviction(op *Operation, machineStatuses map[stri
 		coord.store.ClearUserBipods(op.UserID)
 		coord.store.SetUserStatus(op.UserID, "evicted", "")
 		coord.store.SetUserDRBDDisconnected(op.UserID, false)
-		coord.store.CompleteOperation(op.OperationID)
+		_ = coord.store.CompleteOperation(op.OperationID)
 	default:
 		// Phase 3b will handle orphan cleanup
 		logger.Info("Partial eviction — completing")
 		coord.store.SetUserStatus(op.UserID, "suspended", "eviction interrupted by crash")
 		coord.store.FailOperation(op.OperationID, "interrupted by crash")
+	}
+}
+
+// resumeMigration resumes an interrupted live migration operation.
+func (coord *Coordinator) resumeMigration(op *Operation, machineStatuses map[string]*machineReality) {
+	logger := slog.With("component", "reconciler", "op_id", op.OperationID, "user_id", op.UserID)
+
+	sourceMachine := metaString(op.Metadata, "source_machine")
+	targetMachine := metaString(op.Metadata, "target_machine")
+	stayerMachine := metaString(op.Metadata, "stayer_machine")
+	migrationType := metaString(op.Metadata, "migration_type")
+	sourceAddress := metaString(op.Metadata, "source_address")
+	targetAddress := metaString(op.Metadata, "target_address")
+	stayerAddress := metaString(op.Metadata, "stayer_address")
+
+	logger.Info("Resuming migration",
+		"step", op.CurrentStep, "type", migrationType,
+		"source", sourceMachine, "target", targetMachine, "stayer", stayerMachine,
+	)
+
+	// Helper: cancel migration, revert to 2-node and running
+	cancelMigration := func(reason string) {
+		logger.Info("Cancelling migration", "reason", reason)
+
+		// Clean up target resources if target is online
+		tmr := machineStatuses[targetMachine]
+		if tmr != nil && tmr.Online {
+			client := NewMachineClient(targetAddress)
+			client.DRBDDisconnect(op.UserID)
+			client.DRBDDestroy(op.UserID)
+			client.DeleteUser(op.UserID)
+		}
+		coord.store.RemoveBipod(op.UserID, targetMachine)
+
+		// Revert source and stayer to 2-node config if they are online
+		sourceMinor := metaInt(op.Metadata, "source_minor")
+		stayerMinor := metaInt(op.Metadata, "stayer_minor")
+		sourceLoop := metaString(op.Metadata, "source_loop")
+		stayerLoop := metaString(op.Metadata, "stayer_loop")
+		port := metaInt(op.Metadata, "port")
+
+		bipodNodes := []shared.DRBDNode{
+			{Hostname: sourceMachine, Minor: sourceMinor, Disk: sourceLoop, Address: stripPort(sourceAddress)},
+			{Hostname: stayerMachine, Minor: stayerMinor, Disk: stayerLoop, Address: stripPort(stayerAddress)},
+		}
+
+		// Determine roles: source keeps its original role, stayer is opposite
+		var cancelSourceRole, cancelStayerRole string
+		if migrationType == "primary" {
+			cancelSourceRole = "primary"
+			cancelStayerRole = "secondary"
+		} else {
+			cancelSourceRole = "secondary"
+			cancelStayerRole = "primary"
+		}
+
+		smr := machineStatuses[sourceMachine]
+		if smr != nil && smr.Online {
+			client := NewMachineClient(sourceAddress)
+			sourceReq := &shared.DRBDReconfigureRequest{Nodes: bipodNodes, Port: port, Force: false, Role: cancelSourceRole}
+			if _, err := client.DRBDReconfigure(op.UserID, sourceReq); err != nil {
+				sourceReq.Force = true
+				client.DRBDReconfigure(op.UserID, sourceReq)
+			}
+		}
+
+		stmr := machineStatuses[stayerMachine]
+		if stmr != nil && stmr.Online {
+			client := NewMachineClient(stayerAddress)
+			stayerReq := &shared.DRBDReconfigureRequest{Nodes: bipodNodes, Port: port, Force: false, Role: cancelStayerRole}
+			if _, err := client.DRBDReconfigure(op.UserID, stayerReq); err != nil {
+				stayerReq.Force = true
+				client.DRBDReconfigure(op.UserID, stayerReq)
+			}
+		}
+
+		coord.store.SetUserStatus(op.UserID, "running", "migration cancelled: "+reason)
+		coord.store.CancelOperation(op.OperationID)
+	}
+
+	// Helper: complete cleanup phase (source removed, back to 2-node)
+	completeCleanup := func() {
+		// Source may still need cleanup
+		smr := machineStatuses[sourceMachine]
+		if smr != nil && smr.Online {
+			client := NewMachineClient(sourceAddress)
+			client.DRBDDisconnect(op.UserID)
+			client.DRBDDestroy(op.UserID)
+			client.DeleteUser(op.UserID)
+		}
+
+		// Reconfigure to 2-node (target + stayer)
+		targetMinor := metaInt(op.Metadata, "target_minor")
+		stayerMinor := metaInt(op.Metadata, "stayer_minor")
+		stayerLoop := metaString(op.Metadata, "stayer_loop")
+		port := metaInt(op.Metadata, "port")
+
+		// Get target loop from bipod
+		bipods := coord.store.GetBipods(op.UserID)
+		var targetLoop string
+		for _, b := range bipods {
+			if b.MachineID == targetMachine {
+				targetLoop = b.LoopDevice
+			}
+		}
+
+		bipodNodes := []shared.DRBDNode{
+			{Hostname: targetMachine, Minor: targetMinor, Disk: targetLoop, Address: stripPort(targetAddress)},
+			{Hostname: stayerMachine, Minor: stayerMinor, Disk: stayerLoop, Address: stripPort(stayerAddress)},
+		}
+
+		// Determine roles: target takes the migrated role, stayer keeps its role
+		var cleanupTargetRole, cleanupStayerRole string
+		if migrationType == "primary" {
+			cleanupTargetRole = "primary"
+			cleanupStayerRole = "secondary"
+		} else {
+			cleanupTargetRole = "secondary"
+			cleanupStayerRole = "primary"
+		}
+
+		tmr := machineStatuses[targetMachine]
+		if tmr != nil && tmr.Online {
+			client := NewMachineClient(targetAddress)
+			targetReq := &shared.DRBDReconfigureRequest{Nodes: bipodNodes, Port: port, Force: false, Role: cleanupTargetRole}
+			if _, err := client.DRBDReconfigure(op.UserID, targetReq); err != nil {
+				targetReq.Force = true
+				client.DRBDReconfigure(op.UserID, targetReq)
+			}
+		}
+
+		stmr := machineStatuses[stayerMachine]
+		if stmr != nil && stmr.Online {
+			client := NewMachineClient(stayerAddress)
+			stayerReq := &shared.DRBDReconfigureRequest{Nodes: bipodNodes, Port: port, Force: false, Role: cleanupStayerRole}
+			if _, err := client.DRBDReconfigure(op.UserID, stayerReq); err != nil {
+				stayerReq.Force = true
+				client.DRBDReconfigure(op.UserID, stayerReq)
+			}
+		}
+
+		coord.store.RemoveBipod(op.UserID, sourceMachine)
+		if migrationType == "primary" {
+			coord.store.SetBipodRole(op.UserID, targetMachine, "primary")
+		} else {
+			coord.store.SetBipodRole(op.UserID, targetMachine, "secondary")
+		}
+
+		coord.store.SetUserStatus(op.UserID, "running", "")
+		_ = coord.store.CompleteOperation(op.OperationID)
+		logger.Info("Migration recovery complete")
+	}
+
+	switch op.CurrentStep {
+	case "migrate-target-selected":
+		// Safe to cancel and restart
+		cancelMigration("crashed at target-selected")
+
+	case "migrate-image-created":
+		// Image exists, DRBD not configured — cancel
+		cancelMigration("crashed at image-created")
+
+	case "migrate-drbd-added":
+		// 3-node DRBD configured, may be syncing
+		tmr := machineStatuses[targetMachine]
+		if tmr == nil || !tmr.Online {
+			cancelMigration("target offline during sync")
+			return
+		}
+		// Cancel — let user retry migration manually
+		cancelMigration("crashed during sync phase")
+
+	case "migrate-synced":
+		if migrationType == "secondary" {
+			// Secondary migration — skip to cleanup
+			completeCleanup()
+		} else {
+			// Primary migration — cancel (haven't stopped container yet, safe to revert)
+			cancelMigration("crashed at synced")
+		}
+
+	case "migrate-container-stopped":
+		// CRITICAL: User is DOWN. Must recover ASAP.
+		tmr := machineStatuses[targetMachine]
+		smr := machineStatuses[sourceMachine]
+
+		if tmr != nil && tmr.Online {
+			// Promote target, start container there, cleanup
+			client := NewMachineClient(targetAddress)
+			if _, err := client.DRBDPromote(op.UserID); err != nil {
+				logger.Error("Recovery promote on target failed", "error", err)
+				// Try source fallback
+				if smr != nil && smr.Online {
+					srcClient := NewMachineClient(sourceAddress)
+					srcClient.DRBDPromote(op.UserID)
+					srcClient.ContainerStart(op.UserID)
+					cancelMigration("target promote failed, rolled back to source")
+					return
+				}
+				coord.store.SetUserStatus(op.UserID, "unavailable", "migration recovery failed")
+				coord.store.FailOperation(op.OperationID, "target promote failed during recovery")
+				return
+			}
+			if _, err := client.ContainerStart(op.UserID); err != nil {
+				logger.Error("Recovery container start on target failed", "error", err)
+				coord.store.SetUserStatus(op.UserID, "unavailable", "migration recovery: container start failed")
+				coord.store.FailOperation(op.OperationID, "container start failed during recovery")
+				return
+			}
+			coord.store.SetUserPrimary(op.UserID, targetMachine)
+			completeCleanup()
+		} else if smr != nil && smr.Online {
+			// Target offline, rollback to source
+			srcClient := NewMachineClient(sourceAddress)
+			srcClient.DRBDPromote(op.UserID)
+			srcClient.ContainerStart(op.UserID)
+			cancelMigration("target offline, rolled back to source")
+		} else {
+			coord.store.SetUserStatus(op.UserID, "unavailable", "both source and target offline during migration recovery")
+			coord.store.FailOperation(op.OperationID, "both machines offline")
+		}
+
+	case "migrate-source-demoted":
+		// Source demoted, need to promote target and start container
+		tmr := machineStatuses[targetMachine]
+		if tmr != nil && tmr.Online {
+			client := NewMachineClient(targetAddress)
+			if _, err := client.DRBDPromote(op.UserID); err != nil {
+				logger.Error("Recovery promote on target failed at source-demoted", "error", err)
+				coord.store.SetUserStatus(op.UserID, "unavailable", "migration recovery: target promote failed")
+				coord.store.FailOperation(op.OperationID, "target promote failed during recovery")
+				return
+			}
+			if _, err := client.ContainerStart(op.UserID); err != nil {
+				logger.Error("Recovery container start on target failed at source-demoted", "error", err)
+				coord.store.SetUserStatus(op.UserID, "unavailable", "migration recovery: container start failed")
+				coord.store.FailOperation(op.OperationID, "container start failed during recovery")
+				return
+			}
+			coord.store.SetUserPrimary(op.UserID, targetMachine)
+			completeCleanup()
+		} else {
+			coord.store.SetUserStatus(op.UserID, "unavailable", "target offline after source demoted")
+			coord.store.FailOperation(op.OperationID, "target offline after demote")
+		}
+
+	case "migrate-target-promoted":
+		// Target promoted, need to start container
+		tmr := machineStatuses[targetMachine]
+		if tmr != nil && tmr.Online {
+			client := NewMachineClient(targetAddress)
+			client.ContainerStart(op.UserID)
+			coord.store.SetUserPrimary(op.UserID, targetMachine)
+			completeCleanup()
+		} else {
+			coord.store.SetUserStatus(op.UserID, "unavailable", "target offline after promote")
+			coord.store.FailOperation(op.OperationID, "target offline after promote")
+		}
+
+	case "migrate-container-started":
+		// Container running on target. Just finish cleanup.
+		coord.store.SetUserPrimary(op.UserID, targetMachine)
+		completeCleanup()
+
+	case "migrate-source-cleaned", "migrate-secondary-cleaned":
+		// Everything done, just mark complete
+		coord.store.SetUserStatus(op.UserID, "running", "")
+		_ = coord.store.CompleteOperation(op.OperationID)
+
+	default:
+		logger.Warn("Unknown migration step — cancelling", "step", op.CurrentStep)
+		cancelMigration("unknown step: " + op.CurrentStep)
 	}
 }
 
@@ -571,6 +869,58 @@ func (coord *Coordinator) reconcilePhase3bCleanOrphans(logger *slog.Logger, orph
 		}
 		// Remove stale bipod entry if exists
 		coord.store.RemoveBipod(o.UserID, o.MachineID)
+	}
+}
+
+// reconcilePhase3cCleanStaleTripods cleans up leftover 3rd bipods from interrupted migrations.
+// Running users should have exactly 2 non-stale bipods. If a migration was interrupted between
+// creating the target bipod and completing cleanup, there may be 3.
+func (coord *Coordinator) reconcilePhase3cCleanStaleTripods(logger *slog.Logger, machineStatuses map[string]*machineReality) {
+	users := coord.store.AllUsers()
+	for _, u := range users {
+		if u.Status != "running" {
+			continue
+		}
+
+		bipods := coord.store.GetBipods(u.UserID)
+		var nonStale []*Bipod
+		for _, b := range bipods {
+			if b.Role != "stale" {
+				nonStale = append(nonStale, b)
+			}
+		}
+
+		if len(nonStale) <= 2 {
+			continue
+		}
+
+		// Running user has >2 non-stale bipods — find and remove the extra(s)
+		logger.Warn("[Phase 3c] Running user has extra bipods, cleaning up",
+			"user_id", u.UserID, "bipod_count", len(nonStale))
+
+		// Keep the bipod on the primary machine and one secondary; remove the rest
+		kept := 0
+		for _, b := range nonStale {
+			if b.MachineID == u.PrimaryMachine {
+				kept++
+				continue // keep the primary
+			}
+			if kept < 2 {
+				kept++
+				continue // keep one secondary
+			}
+			// Extra bipod — clean up
+			logger.Info("[Phase 3c] Removing extra bipod",
+				"user_id", u.UserID, "machine_id", b.MachineID)
+			mr := machineStatuses[b.MachineID]
+			if mr != nil && mr.Online {
+				client := NewMachineClient(mr.Address)
+				client.DRBDDisconnect(u.UserID)
+				client.DRBDDestroy(u.UserID)
+				client.DeleteUser(u.UserID)
+			}
+			coord.store.RemoveBipod(u.UserID, b.MachineID)
+		}
 	}
 }
 
@@ -596,6 +946,39 @@ func (coord *Coordinator) reconcilePhase4HandleOffline(logger *slog.Logger) {
 					"user_id", userID, "machine_id", m.MachineID)
 				coord.failoverUser(userID, m.MachineID)
 			}
+		}
+	}
+}
+
+// reconcilePhase5EnsureContainers ensures every "running" user has a container on its primary machine.
+// This is a safety net for cases where a migration crash left the user in "running" state without a container.
+func (coord *Coordinator) reconcilePhase5EnsureContainers(logger *slog.Logger, machineStatuses map[string]*machineReality) {
+	users := coord.store.AllUsers()
+	for _, u := range users {
+		if u.Status != "running" {
+			continue
+		}
+		primary := u.PrimaryMachine
+		if primary == "" {
+			continue
+		}
+		mr := machineStatuses[primary]
+		if mr == nil || !mr.Online {
+			continue
+		}
+
+		// Check if the container is running on the primary machine
+		userInfo, exists := mr.Users[u.UserID]
+		if exists && userInfo.ContainerRunning {
+			continue // container is running, nothing to do
+		}
+
+		// Container is NOT running on the primary — start it
+		logger.Warn("[Phase 5] Running user missing container on primary, starting it",
+			"user_id", u.UserID, "primary", primary)
+		client := NewMachineClient(mr.Address)
+		if _, err := client.ContainerStart(u.UserID); err != nil {
+			logger.Error("[Phase 5] Failed to start container", "user_id", u.UserID, "error", err)
 		}
 	}
 }

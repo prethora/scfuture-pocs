@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 
 	"scfuture/internal/shared"
@@ -15,14 +17,89 @@ type DRBDInfo struct {
 	DiskState       string
 	PeerDiskState   string
 	SyncProgress    *string
+	Peers           []shared.DRBDPeerInfo
+}
+
+func generateDRBDConfig(resName string, nodes []shared.DRBDNode, port int) string {
+	// Sort nodes by hostname for consistent connection-mesh ordering
+	sorted := make([]shared.DRBDNode, len(nodes))
+	copy(sorted, nodes)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Hostname < sorted[j].Hostname
+	})
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "resource %s {\n", resName)
+	b.WriteString("    net {\n")
+	b.WriteString("        protocol A;\n")
+	b.WriteString("        max-buffers 8000;\n")
+	b.WriteString("        max-epoch-size 8000;\n")
+	b.WriteString("        sndbuf-size 0;\n")
+	b.WriteString("        rcvbuf-size 0;\n")
+	b.WriteString("    }\n")
+	b.WriteString("    disk {\n")
+	b.WriteString("        on-io-error detach;\n")
+	b.WriteString("    }\n")
+	for _, node := range sorted {
+		fmt.Fprintf(&b, "    on %s {\n", node.Hostname)
+		fmt.Fprintf(&b, "        node-id %d;\n", stableNodeID(node.Hostname))
+		fmt.Fprintf(&b, "        device /dev/drbd%d minor %d;\n", node.Minor, node.Minor)
+		fmt.Fprintf(&b, "        disk %s;\n", node.Disk)
+		fmt.Fprintf(&b, "        address %s:%d;\n", node.Address, port)
+		b.WriteString("        meta-disk internal;\n")
+		b.WriteString("    }\n")
+	}
+	// connection-mesh is required for 3+ nodes and also works for 2 nodes
+	b.WriteString("    connection-mesh {\n")
+	b.WriteString("        hosts")
+	for _, node := range sorted {
+		fmt.Fprintf(&b, " %s", node.Hostname)
+	}
+	b.WriteString(";\n")
+	b.WriteString("    }\n")
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// stableNodeID derives a stable DRBD node-id from a hostname like "fleet-1".
+// This ensures node-ids are consistent across reconfigurations (2→3→2 nodes),
+// preventing metadata/config mismatches that cause drbdadm adjust/up failures.
+func stableNodeID(hostname string) int {
+	parts := strings.Split(hostname, "-")
+	if len(parts) >= 2 {
+		if n, err := strconv.Atoi(parts[len(parts)-1]); err == nil {
+			return n - 1 // fleet-1→0, fleet-2→1, fleet-3→2
+		}
+	}
+	return 0
+}
+
+func worstDiskState(states []string) string {
+	priority := map[string]int{
+		"Inconsistent": 4,
+		"Outdated":     3,
+		"DUnknown":     2,
+		"UpToDate":     1,
+	}
+	worst := ""
+	worstPri := 0
+	for _, s := range states {
+		if p, ok := priority[s]; ok && p > worstPri {
+			worst = s
+			worstPri = p
+		} else if !ok && worst == "" {
+			worst = s
+		}
+	}
+	return worst
 }
 
 func (a *Agent) DRBDCreate(userID string, req *shared.DRBDCreateRequest) (*shared.DRBDCreateResponse, error) {
 	if err := validateUserID(userID); err != nil {
 		return nil, err
 	}
-	if len(req.Nodes) != 2 {
-		return nil, fmt.Errorf("exactly 2 nodes required")
+	if len(req.Nodes) < 2 || len(req.Nodes) > 3 {
+		return nil, fmt.Errorf("2 or 3 nodes required, got %d", len(req.Nodes))
 	}
 
 	resName := req.ResourceName
@@ -36,43 +113,16 @@ func (a *Agent) DRBDCreate(userID string, req *shared.DRBDCreateRequest) (*share
 
 	// Write config file
 	configPath := fmt.Sprintf("/etc/drbd.d/%s.res", resName)
-	config := fmt.Sprintf(`resource %s {
-    net {
-        protocol A;
-        max-buffers 8000;
-        max-epoch-size 8000;
-        sndbuf-size 0;
-        rcvbuf-size 0;
-    }
-    disk {
-        on-io-error detach;
-    }
-    on %s {
-        device /dev/drbd%d minor %d;
-        disk %s;
-        address %s:%d;
-        meta-disk internal;
-    }
-    on %s {
-        device /dev/drbd%d minor %d;
-        disk %s;
-        address %s:%d;
-        meta-disk internal;
-    }
-}
-`, resName,
-		req.Nodes[0].Hostname, req.Nodes[0].Minor, req.Nodes[0].Minor, req.Nodes[0].Disk, req.Nodes[0].Address, req.Port,
-		req.Nodes[1].Hostname, req.Nodes[1].Minor, req.Nodes[1].Minor, req.Nodes[1].Disk, req.Nodes[1].Address, req.Port,
-	)
+	config := generateDRBDConfig(resName, req.Nodes, req.Port)
 
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		return nil, fmt.Errorf("write DRBD config: %w", err)
 	}
 
-	// Create metadata
-	result, err := runCmd("drbdadm", "create-md", "--force", resName)
+	// Create metadata (--max-peers 2 allows up to 3 nodes for tripod migration)
+	result, err := runCmd("drbdadm", "create-md", "--max-peers", "2", "--force", resName)
 	if err != nil {
-		return nil, cmdError("drbdadm create-md failed", cmdString("drbdadm", "create-md", "--force", resName), result)
+		return nil, cmdError("drbdadm create-md failed", cmdString("drbdadm", "create-md", "--max-peers", "2", "--force", resName), result)
 	}
 
 	// Bring up
@@ -173,6 +223,7 @@ func (a *Agent) DRBDStatus(userID string) (*shared.DRBDStatusResponse, error) {
 		DiskState:       info.DiskState,
 		PeerDiskState:   info.PeerDiskState,
 		SyncProgress:    info.SyncProgress,
+		Peers:           info.Peers,
 		Exists:          true,
 	}, nil
 }
@@ -264,42 +315,15 @@ func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureReques
 	if err := validateUserID(userID); err != nil {
 		return nil, err
 	}
-	if len(req.Nodes) != 2 {
-		return nil, fmt.Errorf("exactly 2 nodes required")
+	if len(req.Nodes) < 2 || len(req.Nodes) > 3 {
+		return nil, fmt.Errorf("2 or 3 nodes required, got %d", len(req.Nodes))
 	}
 
 	resName := "user-" + userID
 	configPath := fmt.Sprintf("/etc/drbd.d/%s.res", resName)
 
-	// Write new config file (same format as DRBDCreate)
-	config := fmt.Sprintf(`resource %s {
-    net {
-        protocol A;
-        max-buffers 8000;
-        max-epoch-size 8000;
-        sndbuf-size 0;
-        rcvbuf-size 0;
-    }
-    disk {
-        on-io-error detach;
-    }
-    on %s {
-        device /dev/drbd%d minor %d;
-        disk %s;
-        address %s:%d;
-        meta-disk internal;
-    }
-    on %s {
-        device /dev/drbd%d minor %d;
-        disk %s;
-        address %s:%d;
-        meta-disk internal;
-    }
-}
-`, resName,
-		req.Nodes[0].Hostname, req.Nodes[0].Minor, req.Nodes[0].Minor, req.Nodes[0].Disk, req.Nodes[0].Address, req.Port,
-		req.Nodes[1].Hostname, req.Nodes[1].Minor, req.Nodes[1].Minor, req.Nodes[1].Disk, req.Nodes[1].Address, req.Port,
-	)
+	// Write new config file
+	config := generateDRBDConfig(resName, req.Nodes, req.Port)
 
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		return nil, fmt.Errorf("write DRBD config: %w", err)
@@ -331,9 +355,9 @@ func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureReques
 		return nil, fmt.Errorf("adjust failed (stderr: %s), coordinator should retry with force=true", result.Stderr)
 	}
 
-	// Force path: full down/up/promote cycle
+	// Force path: full down/up cycle, then promote only if role=primary
 	// The coordinator is responsible for stopping/starting the container around this call
-	slog.Info("DRBD reconfigure via down/up (force)", "component", "drbd", "user", userID)
+	slog.Info("DRBD reconfigure via down/up (force)", "component", "drbd", "user", userID, "role", req.Role)
 
 	// Unmount host if mounted (safety)
 	mountPath := a.mountPath(userID)
@@ -350,10 +374,12 @@ func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureReques
 		return nil, cmdError("drbdadm up failed after reconfigure", cmdString("drbdadm", "up", resName), result)
 	}
 
-	// Promote back to primary
-	result, err = runCmd("drbdadm", "primary", "--force", resName)
-	if err != nil {
-		return nil, cmdError("drbdadm primary failed after reconfigure", cmdString("drbdadm", "primary", "--force", resName), result)
+	// Only promote to primary if the role demands it (secondary nodes stay secondary)
+	if req.Role != "secondary" {
+		result, err = runCmd("drbdadm", "primary", "--force", resName)
+		if err != nil {
+			return nil, cmdError("drbdadm primary failed after reconfigure", cmdString("drbdadm", "primary", "--force", resName), result)
+		}
 	}
 
 	// Update in-memory state
@@ -383,6 +409,7 @@ func (a *Agent) getDRBDStatus(resName string) *DRBDInfo {
 
 // parseDRBDStatusAll parses multi-resource drbdadm status output.
 // Handles Connected, Syncing, Disconnected, and StandAlone formats.
+// Supports multiple peers (2-node and 3-node DRBD configurations).
 //
 // DRBD 9 status lines contain space-separated key:value tokens, e.g.:
 //
@@ -390,7 +417,8 @@ func (a *Agent) getDRBDStatus(resName string) *DRBDInfo {
 //	  disk:UpToDate open:no
 //	  machine-2 role:Secondary
 //	    peer-disk:UpToDate
-//	or: replication:SyncSource peer-disk:Inconsistent done:45.20
+//	  machine-3 role:Secondary
+//	    replication:SyncSource peer-disk:Inconsistent done:45.20
 func parseDRBDStatusAll(output string) map[string]*DRBDInfo {
 	results := make(map[string]*DRBDInfo)
 
@@ -420,20 +448,45 @@ func parseDRBDStatusAll(output string) map[string]*DRBDInfo {
 			}
 		}
 
-		// Parse remaining lines — each line has space-separated key:value tokens
+		// Parse remaining lines — track multiple peers
+		var currentPeer *shared.DRBDPeerInfo
 		inPeerSection := false
+
 		for i := 1; i < len(lines); i++ {
 			line := strings.TrimSpace(lines[i])
 			tokens := strings.Fields(line)
 
-			// Detect peer section: line starts with a hostname followed by role:
-			for _, t := range tokens {
-				if strings.HasPrefix(t, "role:") && !strings.HasPrefix(line, "disk:") &&
-					!strings.HasPrefix(line, "peer-disk:") && !strings.HasPrefix(line, "replication:") {
-					// This is a peer line (e.g. "machine-2 role:Secondary")
-					inPeerSection = true
-					info.ConnectionState = "Connected"
+			// Detect peer section: line has a hostname token followed by role: token
+			// but does NOT start with disk:, peer-disk:, or replication:
+			isPeerLine := false
+			if !strings.HasPrefix(line, "disk:") &&
+				!strings.HasPrefix(line, "peer-disk:") &&
+				!strings.HasPrefix(line, "replication:") {
+				for _, t := range tokens {
+					if strings.HasPrefix(t, "role:") {
+						isPeerLine = true
+						break
+					}
 				}
+			}
+
+			if isPeerLine {
+				// Start new peer
+				inPeerSection = true
+				info.ConnectionState = "Connected"
+				peer := shared.DRBDPeerInfo{}
+				// First token is hostname, rest are key:value
+				if len(tokens) > 0 && !strings.Contains(tokens[0], ":") {
+					peer.Hostname = tokens[0]
+				}
+				for _, t := range tokens {
+					if strings.HasPrefix(t, "role:") {
+						peer.Role = strings.TrimPrefix(t, "role:")
+					}
+				}
+				info.Peers = append(info.Peers, peer)
+				currentPeer = &info.Peers[len(info.Peers)-1]
+				continue
 			}
 
 			// Extract key:value tokens
@@ -441,7 +494,10 @@ func parseDRBDStatusAll(output string) map[string]*DRBDInfo {
 				if strings.HasPrefix(t, "disk:") && !inPeerSection {
 					info.DiskState = strings.TrimPrefix(t, "disk:")
 				}
-				if strings.HasPrefix(t, "peer-disk:") {
+				if strings.HasPrefix(t, "peer-disk:") && currentPeer != nil {
+					currentPeer.DiskState = strings.TrimPrefix(t, "peer-disk:")
+				} else if strings.HasPrefix(t, "peer-disk:") {
+					// Fallback for no peer context
 					info.PeerDiskState = strings.TrimPrefix(t, "peer-disk:")
 				}
 				if strings.HasPrefix(t, "replication:") {
@@ -449,8 +505,26 @@ func parseDRBDStatusAll(output string) map[string]*DRBDInfo {
 				}
 				if strings.HasPrefix(t, "done:") {
 					progress := strings.TrimPrefix(t, "done:")
-					info.SyncProgress = &progress
+					if currentPeer != nil {
+						currentPeer.SyncProgress = &progress
+					}
 				}
+			}
+		}
+
+		// Compute backward-compatible fields from peers
+		if len(info.Peers) > 0 {
+			var diskStates []string
+			for _, p := range info.Peers {
+				if p.DiskState != "" {
+					diskStates = append(diskStates, p.DiskState)
+				}
+				if p.SyncProgress != nil && info.SyncProgress == nil {
+					info.SyncProgress = p.SyncProgress
+				}
+			}
+			if len(diskStates) > 0 {
+				info.PeerDiskState = worstDiskState(diskStates)
 			}
 		}
 

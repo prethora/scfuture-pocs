@@ -75,6 +75,10 @@ func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/users/{id}/evict", coord.handleEvictUser)
 	mux.HandleFunc("GET /api/lifecycle-events", coord.handleGetLifecycleEvents)
 
+	// Live migration (Layer 5.1)
+	mux.HandleFunc("POST /api/users/{id}/migrate", coord.handleMigrateUser)
+	mux.HandleFunc("GET /api/migrations", coord.handleGetMigrations)
+
 	// Events & Operations (Layer 4.6)
 	mux.HandleFunc("GET /api/events", coord.handleGetEvents)
 	mux.HandleFunc("GET /api/operations", coord.handleGetOperations)
@@ -437,6 +441,81 @@ func (coord *Coordinator) handleGetOperations(w http.ResponseWriter, r *http.Req
 		ops = []map[string]interface{}{}
 	}
 	writeJSON(w, http.StatusOK, ops)
+}
+
+func (coord *Coordinator) handleMigrateUser(w http.ResponseWriter, r *http.Request) {
+	userID := r.PathValue("id")
+	var req shared.MigrateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.SourceMachine == "" || req.TargetMachine == "" {
+		writeError(w, http.StatusBadRequest, "source_machine and target_machine are required")
+		return
+	}
+
+	u := coord.store.GetUser(userID)
+	if u == nil {
+		writeError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	if u.Status != "running" {
+		writeError(w, http.StatusConflict, "user must be in running state to migrate (current: "+u.Status+")")
+		return
+	}
+
+	// Validate source is in bipod
+	bipods := coord.store.GetBipods(userID)
+	sourceInBipod := false
+	targetInBipod := false
+	for _, b := range bipods {
+		if b.Role == "stale" {
+			continue
+		}
+		if b.MachineID == req.SourceMachine {
+			sourceInBipod = true
+		}
+		if b.MachineID == req.TargetMachine {
+			targetInBipod = true
+		}
+	}
+	if !sourceInBipod {
+		writeError(w, http.StatusBadRequest, "source_machine is not in user's bipod")
+		return
+	}
+	if targetInBipod {
+		writeError(w, http.StatusBadRequest, "target_machine is already in user's bipod")
+		return
+	}
+
+	// Validate target machine exists and is active
+	targetMachine := coord.store.GetMachine(req.TargetMachine)
+	if targetMachine == nil {
+		writeError(w, http.StatusBadRequest, "target_machine not found")
+		return
+	}
+	if targetMachine.Status != "active" {
+		writeError(w, http.StatusBadRequest, "target_machine is not active (status: "+targetMachine.Status+")")
+		return
+	}
+
+	coord.store.SetUserStatus(userID, "migrating", "")
+	go coord.MigrateUser(userID, req.SourceMachine, req.TargetMachine)
+
+	slog.Info("Migration started", "user_id", userID, "source", req.SourceMachine, "target", req.TargetMachine)
+	writeJSON(w, http.StatusAccepted, shared.MigrateUserResponse{
+		UserID: userID,
+		Status: "migrating",
+	})
+}
+
+func (coord *Coordinator) handleGetMigrations(w http.ResponseWriter, r *http.Request) {
+	events := coord.store.GetMigrationEvents()
+	if events == nil {
+		events = []MigrationEvent{}
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

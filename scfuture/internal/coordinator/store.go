@@ -46,6 +46,18 @@ type LifecycleEvent struct {
 	Timestamp  time.Time `json:"timestamp"`
 }
 
+type MigrationEvent struct {
+	UserID        string    `json:"user_id"`
+	SourceMachine string    `json:"source_machine"`
+	TargetMachine string    `json:"target_machine"`
+	MigrationType string    `json:"migration_type"` // "primary" or "secondary"
+	Success       bool      `json:"success"`
+	Error         string    `json:"error,omitempty"`
+	Method        string    `json:"method,omitempty"` // "adjust" or "down_up"
+	DurationMS    int64     `json:"duration_ms"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
 // ─── Operation tracking (crash recovery) ───
 
 type Operation struct {
@@ -610,13 +622,28 @@ func (s *Store) AllocateMinor(machineID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var maxMinor sql.NullInt64
-	s.db.QueryRow(`SELECT MAX(drbd_minor) FROM bipods WHERE machine_id=$1 AND role != 'stale'`, machineID).Scan(&maxMinor)
-	nextMinor := 0
-	if maxMinor.Valid {
-		nextMinor = int(maxMinor.Int64) + 1
+	// Collect all minors currently in use on this machine (including stale, since
+	// the DRBD resource may still be running on the machine even if marked stale in DB)
+	rows, err := s.db.Query(`SELECT drbd_minor FROM bipods WHERE machine_id=$1`, machineID)
+	if err != nil {
+		return 0
 	}
-	return nextMinor
+	defer rows.Close()
+
+	used := make(map[int]bool)
+	for rows.Next() {
+		var minor int
+		if rows.Scan(&minor) == nil {
+			used[minor] = true
+		}
+	}
+
+	// Find first available minor
+	for i := 0; ; i++ {
+		if !used[i] {
+			return i
+		}
+	}
 }
 
 func (s *Store) SelectMachines() (primary *Machine, secondary *Machine, err error) {
@@ -818,8 +845,9 @@ func (s *Store) UpdateOperationStep(opID, step string) {
 	s.db.Exec(`UPDATE operations SET current_step=$1 WHERE operation_id=$2`, step, opID)
 }
 
-func (s *Store) CompleteOperation(opID string) {
-	s.db.Exec(`UPDATE operations SET status='complete', completed_at=NOW() WHERE operation_id=$1`, opID)
+func (s *Store) CompleteOperation(opID string) error {
+	_, err := s.db.Exec(`UPDATE operations SET status='complete', completed_at=NOW() WHERE operation_id=$1`, opID)
+	return err
 }
 
 func (s *Store) FailOperation(opID, errMsg string) {
@@ -857,10 +885,11 @@ func (s *Store) GetIncompleteOperations() ([]*Operation, error) {
 
 // ─── Unified event recording ───
 
-func (s *Store) RecordEvent(eventType string, machineID, userID, operationID string, details map[string]interface{}) {
+func (s *Store) RecordEvent(eventType string, machineID, userID, operationID string, details map[string]interface{}) error {
 	detailsJSON, _ := json.Marshal(details)
-	s.db.Exec(`INSERT INTO events (event_type, machine_id, user_id, operation_id, details) VALUES ($1, $2, $3, $4, $5)`,
+	_, err := s.db.Exec(`INSERT INTO events (event_type, machine_id, user_id, operation_id, details) VALUES ($1, $2, $3, $4, $5)`,
 		eventType, machineID, userID, operationID, detailsJSON)
+	return err
 }
 
 func (s *Store) RecordFailoverEvent(event FailoverEvent) {
@@ -872,7 +901,7 @@ func (s *Store) RecordFailoverEvent(event FailoverEvent) {
 		"error":        event.Error,
 		"duration_ms":  event.DurationMS,
 	}
-	s.RecordEvent("failover", event.FromMachine, event.UserID, "", details)
+	_ = s.RecordEvent("failover", event.FromMachine, event.UserID, "", details)
 }
 
 func (s *Store) GetFailoverEvents() []FailoverEvent {
@@ -922,7 +951,7 @@ func (s *Store) RecordReformationEvent(event ReformationEvent) {
 		"method":        event.Method,
 		"duration_ms":   event.DurationMS,
 	}
-	s.RecordEvent("reformation", "", event.UserID, "", details)
+	_ = s.RecordEvent("reformation", "", event.UserID, "", details)
 }
 
 func (s *Store) GetReformationEvents() []ReformationEvent {
@@ -970,7 +999,7 @@ func (s *Store) RecordLifecycleEvent(event LifecycleEvent) {
 		"error":       event.Error,
 		"duration_ms": event.DurationMS,
 	}
-	s.RecordEvent("lifecycle_"+event.Type, "", event.UserID, "", details)
+	_ = s.RecordEvent("lifecycle_"+event.Type, "", event.UserID, "", details)
 }
 
 func (s *Store) GetLifecycleEvents() []LifecycleEvent {
@@ -1001,6 +1030,62 @@ func (s *Store) GetLifecycleEvents() []LifecycleEvent {
 			le.DurationMS = int64(v)
 		}
 		result = append(result, le)
+	}
+	return result
+}
+
+// ─── Migration event methods (Layer 5.1) ───
+
+func (s *Store) RecordMigrationEvent(event MigrationEvent) error {
+	details := map[string]interface{}{
+		"source_machine": event.SourceMachine,
+		"target_machine": event.TargetMachine,
+		"migration_type": event.MigrationType,
+		"success":        event.Success,
+		"error":          event.Error,
+		"method":         event.Method,
+		"duration_ms":    event.DurationMS,
+	}
+	return s.RecordEvent("migration", event.SourceMachine, event.UserID, "", details)
+}
+
+func (s *Store) GetMigrationEvents() []MigrationEvent {
+	rows, err := s.db.Query(`SELECT user_id, details, timestamp FROM events WHERE event_type='migration' ORDER BY timestamp`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var result []MigrationEvent
+	for rows.Next() {
+		var userID string
+		var detailsJSON []byte
+		var ts time.Time
+		rows.Scan(&userID, &detailsJSON, &ts)
+		var details map[string]interface{}
+		json.Unmarshal(detailsJSON, &details)
+		me := MigrationEvent{UserID: userID, Timestamp: ts}
+		if v, ok := details["source_machine"].(string); ok {
+			me.SourceMachine = v
+		}
+		if v, ok := details["target_machine"].(string); ok {
+			me.TargetMachine = v
+		}
+		if v, ok := details["migration_type"].(string); ok {
+			me.MigrationType = v
+		}
+		if v, ok := details["success"].(bool); ok {
+			me.Success = v
+		}
+		if v, ok := details["error"].(string); ok {
+			me.Error = v
+		}
+		if v, ok := details["method"].(string); ok {
+			me.Method = v
+		}
+		if v, ok := details["duration_ms"].(float64); ok {
+			me.DurationMS = int64(v)
+		}
+		result = append(result, me)
 	}
 	return result
 }

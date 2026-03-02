@@ -101,7 +101,7 @@ func (coord *Coordinator) suspendUser(userID string) {
 	// ── Step 5: Set status → "suspended" ──
 	coord.store.SetUserStatus(userID, "suspended", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "suspension", Success: true,
@@ -240,7 +240,7 @@ func (coord *Coordinator) warmReactivate(userID string) {
 	coord.store.SetBipodRole(userID, primaryBipod.MachineID, "primary")
 	coord.store.SetUserStatus(userID, "running", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "reactivation_warm", Success: true,
@@ -422,7 +422,7 @@ func (coord *Coordinator) coldReactivate(userID string) {
 	// ── Step 9: Update state ──
 	coord.store.SetUserStatus(userID, "running", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "reactivation_cold", Success: true,
@@ -546,7 +546,7 @@ func (coord *Coordinator) evictUser(userID string) {
 	coord.store.ClearUserBipods(userID)
 	coord.store.SetUserStatus(userID, "evicted", "")
 	coord.store.SetUserDRBDDisconnected(userID, false)
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 
 	coord.store.RecordLifecycleEvent(LifecycleEvent{
 		UserID: userID, Type: "eviction", Success: true,

@@ -220,7 +220,7 @@ func (coord *Coordinator) ProvisionUser(userID string) {
 
 	// ── Step 8: Mark running ──
 	coord.store.SetUserStatus(userID, "running", "")
-	coord.store.CompleteOperation(opID)
+	_ = coord.store.CompleteOperation(opID)
 	logger.Info("Provisioning complete — user is running")
 }
 

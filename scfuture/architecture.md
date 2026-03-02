@@ -1,9 +1,9 @@
 # scfuture — Architecture Document
 
-**Layer:** 4.6 — Crash Recovery, Reconciliation & Postgres Migration
+**Layer:** 5.1 — Tripod Primitive & Manual Live Migration
 **Module:** `scfuture` (Go 1.22, one external dependency: `github.com/lib/pq`)
-**Status:** 67/67 (Layer 4.6), 63/63 (Layer 4.5), 91/91 (Layer 4.4), 62/62 (Layer 4.3), 55/55 (Layer 4.2), 66/66 (Layer 4.1)
-**Last updated:** 2026-03-01
+**Status:** 73/73 (Layer 5.1), 67/67 (Layer 4.6), 63/63 (Layer 4.5), 91/91 (Layer 4.4), 62/62 (Layer 4.3), 55/55 (Layer 4.2), 66/66 (Layer 4.1)
+**Last updated:** 2026-03-02
 
 ---
 
@@ -20,9 +20,9 @@ Each user gets:
 3. A **Btrfs filesystem** with subvolumes and snapshots on the DRBD device
 4. A **Docker container** that mounts the DRBD block device directly (device-mount pattern)
 
-The coordinator drives provisioning by calling machine agent HTTP APIs. Machine agents self-register with the coordinator and send heartbeats every 10 seconds. The coordinator runs a health checker that detects machine failures and automatically fails over affected users. A reformer goroutine restores 2-copy replication after failover by provisioning new secondaries, and cleans up stale resources on machines that return from the dead. A retention enforcer goroutine manages the lifecycle of suspended users — automatically disconnecting DRBD after a warm retention period and evicting users (deleting fleet resources, keeping B2 backups) after an eviction period. Users can be suspended (containers stopped, data backed up to Backblaze B2), reactivated via warm path (images still on fleet) or cold path (restored from B2), and evicted (all fleet resources deleted).
+The coordinator drives provisioning by calling machine agent HTTP APIs. Machine agents self-register with the coordinator and send heartbeats every 10 seconds. The coordinator runs a health checker that detects machine failures and automatically fails over affected users. A reformer goroutine restores 2-copy replication after failover by provisioning new secondaries, and cleans up stale resources on machines that return from the dead. A retention enforcer goroutine manages the lifecycle of suspended users — automatically disconnecting DRBD after a warm retention period and evicting users (deleting fleet resources, keeping B2 backups) after an eviction period. Users can be suspended (containers stopped, data backed up to Backblaze B2), reactivated via warm path (images still on fleet) or cold path (restored from B2), and evicted (all fleet resources deleted). Users can be **live-migrated** between machines via a temporary tripod (3-node DRBD) configuration — data syncs transparently to the target, then a brief switchover (~5-15s for primary migration, zero downtime for secondary migration) moves the user's world.
 
-All coordinator state is persisted to **Supabase Postgres** (via pgbouncer connection pooler). An in-memory cache (populated from Postgres on startup) provides fast reads. Every mutation writes through to Postgres first, then updates the cache. On startup, the coordinator acquires a **Postgres advisory lock** for singleton enforcement, runs a **five-phase reconciliation** algorithm to recover from crashes, then starts background goroutines and the HTTP server. All multi-step operations are tracked in an **operations table** with step-by-step progress, enabling the reconciler to resume or safely roll back interrupted work. A **fault injection** system (`FAIL_AT` deterministic crash, `CHAOS_MODE` random 5% crash) enables comprehensive crash recovery testing.
+All coordinator state is persisted to **Supabase Postgres** (via pgbouncer connection pooler). An in-memory cache (populated from Postgres on startup) provides fast reads. Every mutation writes through to Postgres first, then updates the cache. On startup, the coordinator acquires a **Postgres advisory lock** for singleton enforcement, runs a **six-phase reconciliation** algorithm to recover from crashes, then starts background goroutines and the HTTP server. All multi-step operations are tracked in an **operations table** with step-by-step progress, enabling the reconciler to resume or safely roll back interrupted work. A **fault injection** system (`FAIL_AT` deterministic crash, `CHAOS_MODE` random 5% crash) enables comprehensive crash recovery testing.
 
 ### Key Design Decisions
 
@@ -33,7 +33,7 @@ All coordinator state is persisted to **Supabase Postgres** (via pgbouncer conne
 - **Postgres-backed state with in-memory cache (coordinator):** All coordinator state is persisted to Supabase Postgres. An in-memory cache provides fast reads; every write goes to Postgres first. The cache is loaded from Postgres on startup via `loadCache()` and can be refreshed via `ReloadCache()`.
 - **Advisory lock singleton:** `pg_try_advisory_lock(12345)` ensures only one coordinator instance is active. Stale locks from crashed pgbouncer sessions are cleared via `pg_terminate_backend()`.
 - **Operation tracking for crash recovery:** Every multi-step operation (provision, failover, reformation, suspension, reactivation, eviction) creates a row in the `operations` table. `coord.step(opID, stepName)` records progress and checks for fault injection. The reconciler reads incomplete operations on startup and resumes or rolls back each one.
-- **Five-phase startup reconciliation:** Phase 1 probes machines, Phase 2 reconciles DB with reality, Phase 3 resumes interrupted operations, Phase 3b cleans orphans, Phase 4 handles offline machines.
+- **Six-phase startup reconciliation:** Phase 1 probes machines, Phase 2 reconciles DB with reality, Phase 3 resumes interrupted operations, Phase 3b cleans orphans, Phase 3c cleans stale tripods from interrupted migrations, Phase 4 handles offline machines, Phase 5 ensures running users have containers on their primary machines.
 - **Graceful shutdown:** SIGTERM/SIGINT triggers `context.Cancel()` to stop background goroutines, then `server.Shutdown()` for in-flight requests, then `store.Close()` for DB connection.
 - **Balanced placement:** Coordinator selects the 2 least-loaded active machines, excluding any above 85% disk usage.
 
@@ -73,9 +73,10 @@ scfuture/
 │   └── coordinator/
 │       ├── server.go                      # HTTP routing, handlers, Coordinator struct, fault injection
 │       ├── store.go                       # Postgres-backed state store (machines, users, bipods, operations, events)
-│       ├── reconciler.go                  # five-phase startup reconciliation + operation resume handlers
+│       ├── reconciler.go                  # six-phase startup reconciliation + operation resume handlers
 │       ├── fleet.go                       # fleet register/heartbeat handling
 │       ├── provisioner.go                 # 8-step provisioning state machine
+│       ├── migrator.go                    # live migration orchestration (tripod → switchover → cleanup)
 │       ├── machineapi.go                  # HTTP client for calling machine agents
 │       ├── healthcheck.go                 # health checker goroutine + failover logic
 │       ├── reformer.go                    # bipod reformation + stale cleanup goroutine
@@ -114,7 +115,12 @@ scfuture/
     │   └── cloud-init/
     │       ├── coordinator.yaml
     │       └── fleet.yaml
-    └── layer-4.6/                         # Layer 4.6 test infrastructure (1 coord + 3 fleet + B2 + Supabase Postgres)
+    ├── layer-4.6/                         # Layer 4.6 test infrastructure (1 coord + 3 fleet + B2 + Supabase Postgres)
+    │   ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
+    │   └── cloud-init/
+    │       ├── coordinator.yaml
+    │       └── fleet.yaml
+    └── layer-5.1/                         # Layer 5.1 test infrastructure (1 coord + 3 fleet + B2 + Supabase Postgres)
         ├── run.sh, common.sh, infra.sh, deploy.sh, test_suite.sh
         └── cloud-init/
             ├── coordinator.yaml
@@ -127,7 +133,7 @@ scfuture/
 
 All types that cross the HTTP boundary live here. Used by both machine agent and coordinator.
 
-### `types.go` — 36 type definitions
+### `types.go` — 41 type definitions
 
 ```go
 // ─── Machine Agent: Image types ───
@@ -140,9 +146,11 @@ DRBDCreateRequest        { ResourceName string; Nodes []DRBDNode; Port int }
 DRBDCreateResponse       { AlreadyExisted bool }
 DRBDPromoteResponse      { OK, AlreadyExisted bool }
 DRBDDemoteResponse       { OK, AlreadyExisted bool }
-DRBDStatusResponse       { Resource, Role, ConnectionState, DiskState, PeerDiskState string; SyncProgress *string; Exists bool }
+DRBDStatusResponse       { Resource, Role, ConnectionState, DiskState, PeerDiskState string; SyncProgress *string; Exists bool;
+                           Peers []DRBDPeerInfo }                                   // Layer 5.1 — multi-peer support
+DRBDPeerInfo             { Hostname, Role, DiskState string; SyncProgress *string } // Layer 5.1
 DRBDDisconnectResponse   { Status string; WasConnected bool }                       // Layer 4.4
-DRBDReconfigureRequest   { Nodes []DRBDNode; Port int; Force bool }                 // Layer 4.4
+DRBDReconfigureRequest   { Nodes []DRBDNode; Port int; Force bool; Role string }    // Layer 4.4, Role added Layer 5.1
 DRBDReconfigureResponse  { Status, Method string }                                  // Layer 4.4
 DRBDConnectResponse      { Status string }                                          // Layer 4.5
 
@@ -188,6 +196,12 @@ ReformationEventResponse { UserID, OldSecondary, NewSecondary string; Success bo
 
 // ─── Lifecycle types (coordinator lifecycle) ─── Layer 4.5
 LifecycleEventResponse   { UserID, Type string; Success bool; Error string; DurationMS int64; Timestamp string }
+
+// ─── Migration types (coordinator migrator) ─── Layer 5.1
+MigrateUserRequest       { SourceMachine, TargetMachine string }
+MigrateUserResponse      { UserID, Status string }
+MigrationEventResponse   { UserID, SourceMachine, TargetMachine, MigrationType string; Success bool; Error, Method string;
+                           DurationMS int64; Timestamp string }
 ```
 
 ---
@@ -210,7 +224,7 @@ func NewCoordinator(databaseURL, b2BucketName string) (*Coordinator, error) // L
 func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux)
 func (coord *Coordinator) GetStore() *Store
 func (coord *Coordinator) SetCancelFunc(cancel context.CancelFunc)          // Layer 4.6
-func (coord *Coordinator) Reconcile()                                       // Layer 4.6 — five-phase startup reconciliation
+func (coord *Coordinator) Reconcile()                                       // Layer 4.6 — six-phase startup reconciliation (Phase 3c + Phase 5 added Layer 5.1)
 func (coord *Coordinator) step(opID, stepName string)                       // Layer 4.6 — record step + check fault injection
 func (coord *Coordinator) checkFault(name string)                           // Layer 4.6 — deterministic + chaos crash
 ```
@@ -220,7 +234,7 @@ func (coord *Coordinator) checkFault(name string)                           // L
 - `checkFault(name)` — if `FAIL_AT == name`, calls `os.Exit(1)`. If `CHAOS_MODE` is true, crashes with 5% probability (`CHAOS_PROBABILITY` env var overrides).
 - Used by provisioner, lifecycle, reformer, and healthcheck to instrument every multi-step operation.
 
-**Routes (14):**
+**Routes (16):**
 
 | Method | Path | Handler | Description |
 |--------|------|---------|-------------|
@@ -238,10 +252,14 @@ func (coord *Coordinator) checkFault(name string)                           // L
 | `POST` | `/api/users/{id}/reactivate` | `handleReactivateUser` | Reactivate user (async, warm or cold) |
 | `POST` | `/api/users/{id}/evict` | `handleEvictUser` | Evict user (async) |
 | `GET` | `/api/lifecycle-events` | `handleGetLifecycleEvents` | List all lifecycle events |
+| `POST` | `/api/users/{id}/migrate` | `handleMigrateUser` | Trigger live migration (async) |
+| `GET` | `/api/migrations` | `handleGetMigrations` | List all migration events |
 
 `handleProvisionUser` validates user is in `"registered"` state, sets status to `"provisioning"`, launches `coord.ProvisionUser(userID)` in a goroutine, and returns immediately.
 
 Lifecycle handlers (`handleSuspendUser`, `handleReactivateUser`, `handleEvictUser`) validate the user is in an appropriate state, then launch the operation in a goroutine and return immediately. The user's status is updated asynchronously as the operation progresses.
+
+`handleMigrateUser` (Layer 5.1) validates the user is in `"running"` state, validates source is in the user's bipod, validates target is active and not in the bipod, sets status to `"migrating"`, launches `coord.MigrateUser(userID, source, target)` in a goroutine, and returns immediately.
 
 ### 4.2 State Store (`store.go`)
 
@@ -274,7 +292,7 @@ func NewStore(databaseURL string) (*Store, error) // Layer 4.6 — connects to P
 type Operation struct {
     OperationID string
     Type        string    // "provision", "failover", "reformation", "suspension",
-                          // "reactivation_warm", "reactivation_cold", "eviction"
+                          // "reactivation_warm", "reactivation_cold", "eviction", "live_migration"
     UserID      string
     Status      string    // "in_progress", "complete", "failed", "cancelled"
     CurrentStep string    // last recorded step (e.g., "provision-drbd-created")
@@ -317,6 +335,7 @@ Failover statuses: `"running"` → `"failing_over"` → `"running_degraded"` (pr
 Secondary death: `"running"` → `"running_degraded"`.
 Reformation statuses: `"running_degraded"` → `"reforming"` → `"running"` (bipod restored).
 Lifecycle statuses: `"running"` → `"suspending"` → `"suspended"` → `"reactivating"` → `"running"` (warm) or `"evicted"` → `"reactivating"` → `"running"` (cold).
+Migration statuses: `"running"` → `"migrating"` → `"running"` (Layer 5.1).
 
 **Bipod:**
 ```go
@@ -355,6 +374,18 @@ type LifecycleEvent struct {
     UserID, Type string   // Type: "suspension", "reactivation_warm", "reactivation_cold", "eviction", "drbd_disconnect"
     Success bool
     Error string
+    DurationMS int64
+    Timestamp time.Time
+}
+```
+
+**MigrationEvent (Layer 5.1):**
+```go
+type MigrationEvent struct {
+    UserID, SourceMachine, TargetMachine string
+    MigrationType string   // "primary" or "secondary"
+    Success bool
+    Error, Method string   // Method: "adjust" or "down_up"
     DurationMS int64
     Timestamp time.Time
 }
@@ -416,6 +447,8 @@ func (s *Store) RecordReformationEvent(event ReformationEvent)
 func (s *Store) GetReformationEvents() []ReformationEvent
 func (s *Store) RecordLifecycleEvent(event LifecycleEvent)
 func (s *Store) GetLifecycleEvents() []LifecycleEvent
+func (s *Store) RecordMigrationEvent(event MigrationEvent) error    // Layer 5.1
+func (s *Store) GetMigrationEvents() []MigrationEvent               // Layer 5.1
 
 // Postgres-specific (Layer 4.6)
 func (s *Store) AcquireAdvisoryLock() error       // pg_try_advisory_lock(12345) with stale session recovery
@@ -656,7 +689,56 @@ func (coord *Coordinator) disconnectSuspendedDRBD(userID string)
 2. Set `DRBDDisconnected = true` in store
 3. Record lifecycle event (`drbd_disconnect`)
 
-### 4.10 Reconciler (`reconciler.go`) — Layer 4.6
+### 4.10 Migrator (`migrator.go`) — Layer 5.1
+
+```go
+const MigrationSyncTimeout = 300 * time.Second
+
+func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID string)
+```
+
+Runs in its own goroutine (launched by `handleMigrateUser`). Creates a `live_migration` operation and drives the full migration sequence. Two migration types:
+
+- **Primary migration** — moves the primary role. Container stops on source, starts on target. ~5-15s downtime.
+- **Secondary migration** — moves the secondary copy. Container on primary stayer never stops. Zero user downtime.
+
+**Migration steps (primary):**
+
+```
+Step 1: Determine migration type, gather metadata, create operation, create target bipod
+        → coord.step("migrate-target-selected")
+Step 2: CreateImage on target (empty, same size)
+        → coord.step("migrate-image-created")
+Step 3: Configure temporary tripod (3-node DRBD):
+        - DRBDCreate on target (3-node config)
+        - DRBDReconfigure on source (adjust → add target; force fallback if adjust fails)
+        - DRBDReconfigure on stayer (adjust → add target)
+        → coord.step("migrate-drbd-added")
+Step 4: Wait for DRBD sync (poll source DRBDStatus for target peer UpToDate, 5min timeout)
+        → coord.step("migrate-synced")
+Step 5: ContainerStop on source (SIGTERM graceful shutdown)
+        → coord.step("migrate-container-stopped")
+Step 6: DRBDDemote on source
+        → coord.step("migrate-source-demoted")
+Step 7: DRBDPromote on target
+        → coord.step("migrate-target-promoted")
+Step 8: ContainerStart on target
+        → coord.step("migrate-container-started")
+Step 9: Cleanup source — disconnect, destroy DRBD, delete image, reconfigure target+stayer to 2-node
+        → SetUserPrimary(target)
+        → coord.step("migrate-source-cleaned")
+Step 10: SetUserStatus("running"), CompleteOperation, RecordMigrationEvent
+```
+
+**Secondary migration** skips Steps 5-8 (no container actions, no promote/demote). Uses `"migrate-secondary-cleaned"` instead of `"migrate-source-cleaned"`.
+
+**Error recovery:**
+- `containerStopped` flag tracks if the container was stopped. If the fail handler runs after container stop, it restarts the container on the source machine.
+- `sourceClient` is declared before the fail closure so the closure can access it.
+- Each step uses a `retry` helper (one retry after 2s).
+- DRBD reconfigure: tries `adjust` first (zero downtime), falls back to `Force` (down/up with container stop/start for primary).
+
+### 4.11 Reconciler (`reconciler.go`) — Layer 4.6, extended Layer 5.1
 
 ```go
 func (coord *Coordinator) Reconcile()
@@ -671,7 +753,9 @@ func (coord *Coordinator) reconcilePhase1DiscoverReality(logger) map[string]*mac
 func (coord *Coordinator) reconcilePhase2ReconcileDB(logger, machineStatuses) []orphanEntry
 func (coord *Coordinator) reconcilePhase3ResumeOperations(logger, machineStatuses) int
 func (coord *Coordinator) reconcilePhase3bCleanOrphans(logger, orphans)
+func (coord *Coordinator) reconcilePhase3cCleanStaleTripods(logger, machineStatuses) // Layer 5.1
 func (coord *Coordinator) reconcilePhase4HandleOffline(logger)
+func (coord *Coordinator) reconcilePhase5EnsureContainers(logger, machineStatuses)   // Layer 5.1
 
 // Operation resume handlers
 func (coord *Coordinator) resumeProvision(op, machineStatuses)
@@ -681,9 +765,10 @@ func (coord *Coordinator) resumeSuspension(op, machineStatuses)
 func (coord *Coordinator) resumeWarmReactivation(op, machineStatuses)
 func (coord *Coordinator) resumeColdReactivation(op, machineStatuses)
 func (coord *Coordinator) resumeEviction(op, machineStatuses)
+func (coord *Coordinator) resumeMigration(op, machineStatuses)           // Layer 5.1
 ```
 
-Called **before** starting background goroutines or HTTP server. Five phases:
+Called **before** starting background goroutines or HTTP server. Six phases:
 
 **Phase 1 — Discover Reality:** Probes all machines in the DB via their `/status` endpoint (5s timeout). Online machines get status `"active"`, unreachable machines get status `"dead"`. Collects per-machine user inventory (image exists, DRBD role, container running). Calls `ReloadCache()` after status updates.
 
@@ -704,11 +789,19 @@ Called **before** starting background goroutines or HTTP server. Five phases:
 - `resumeWarmReactivation` — if container running, complete; otherwise revert to `"suspended"`
 - `resumeColdReactivation` — if container running, complete; otherwise clean partial resources and revert to `"evicted"`
 - `resumeEviction` — uses `switch op.CurrentStep`: if resources cleaned, complete; if backup verified, re-clean resources; otherwise revert to `"suspended"`
-- Also catches users stuck in `"provisioning"` with no operation row → marks `"failed"`
+- `resumeMigration` (Layer 5.1) — handles 10 crash points across the migration lifecycle:
+  - Early steps (target-selected, image-created, drbd-added, synced): cancels migration — removes target bipod and resources, reverts user to `"running"`
+  - Mid steps (container-stopped, source-demoted): promotes target if target is online and has data, otherwise attempts rollback to source
+  - Late steps (target-promoted, container-started, source-cleaned/secondary-cleaned): completes remaining cleanup
+  - Also catches users stuck in `"migrating"` with no operation row → reverts to `"running"`
 
 **Phase 3b — Clean Orphans:** For each orphan from Phase 2, calls `DeleteUser` on the machine and `RemoveBipod` in store.
 
+**Phase 3c — Clean Stale Tripods (Layer 5.1):** Finds running users with >2 non-stale bipods (leftover from interrupted migrations). For each extra bipod on an active machine: disconnects DRBD, destroys DRBD, deletes user images, removes bipod from store. Reduces tripod back to bipod.
+
 **Phase 4 — Handle Offline:** For each machine with status `"dead"`, finds users in `"running"` or `"running_degraded"` and triggers `failoverUser`.
+
+**Phase 5 — Ensure Containers (Layer 5.1):** For each user in `"running"` state, verifies a container is running on the user's primary machine. If the container is missing (e.g., migration failed after container stop, reconciler set user to "running" but didn't start container), starts the container via the machine agent API.
 
 ---
 
@@ -811,7 +904,11 @@ func isMounted(path string) bool
 - If `Force=false`: runs `drbdadm adjust {resName}`. DRBD reads the new config, sees the new peer address, and connects. **Zero downtime** — the container keeps running.
 - If `Force=true`: unmounts host if mounted, runs `drbdadm down`, `drbdadm up`, `drbdadm primary --force`. Used as fallback if adjust fails (requires container stop/start by the coordinator).
 
-**DRBD config:** Protocol A, internal meta-disk, resource name `user-{userID}`.
+**DRBDCreate** (Layer 5.1 update): Accepts 2 or 3 nodes. Passes `--max-peers 2` to `drbdadm create-md` for all resources, enabling later tripod expansion.
+
+**DRBDStatus** (Layer 5.1 update): `parseDRBDStatusAll` now parses multi-peer status. Each peer's hostname, role, disk state, and sync progress are tracked in `Peers []DRBDPeerInfo`. The legacy `PeerDiskState` and `SyncProgress` fields are derived from the first peer for backward compatibility.
+
+**DRBD config:** Protocol A, internal meta-disk, resource name `user-{userID}`, `--max-peers 2`.
 
 #### `btrfs.go` — Filesystem Provisioning & Snapshots
 
@@ -904,7 +1001,7 @@ Runs in a goroutine. Registers with coordinator (retries every 5s until success)
 2. Reads env: `LISTEN_ADDR` (default `0.0.0.0:8080`), `DATABASE_URL` (required), `B2_BUCKET_NAME`
 3. Creates `Coordinator` via `NewCoordinator(databaseURL, b2BucketName)` — connects to Postgres, runs schema migration, loads cache
 4. Acquires advisory lock via `coord.GetStore().AcquireAdvisoryLock()` — singleton enforcement
-5. Runs reconciliation via `coord.Reconcile()` — five-phase crash recovery (BEFORE goroutines/HTTP)
+5. Runs reconciliation via `coord.Reconcile()` — six-phase crash recovery (BEFORE goroutines/HTTP)
 6. Creates `context.WithCancel`, calls `coord.SetCancelFunc(cancel)`
 7. Starts health checker, reformer, and retention enforcer goroutines
 8. Registers routes, starts HTTP server
@@ -931,16 +1028,16 @@ Runs in a goroutine. Registers with coordinator (retries every 5s until success)
 
 ## 8. Infrastructure & Deployment
 
-### Layer 4.6 Topology
+### Layer 5.1 Topology
 
-- 1x coordinator (`l46-coordinator`, private `10.0.0.2`)
-- 3x fleet machines (`l46-fleet-{1,2,3}`, private IPs auto-assigned)
+- 1x coordinator (`l51-coordinator`, private `10.0.0.2`)
+- 3x fleet machines (`l51-fleet-{1,2,3}`, private `10.0.0.{3,4,5}`)
 - All Hetzner Cloud `cx23`, Ubuntu 24.04, private network `10.0.0.0/24`
 - 1x Backblaze B2 bucket (created/destroyed per test run by `run.sh`)
 - 1x Supabase Postgres database (external, `DATABASE_URL` via pgbouncer port 6543)
-- Same base topology as Layers 4.2–4.5 (with `l46-` prefix)
+- Same base topology as Layers 4.2–4.6 (with `l51-` prefix)
 
-### Deployment Flow (`scripts/layer-4.6/deploy.sh`)
+### Deployment Flow (`scripts/layer-5.1/deploy.sh`)
 
 **Coordinator:**
 1. Wait for SSH + cloud-init
@@ -951,10 +1048,10 @@ Runs in a goroutine. Registers with coordinator (retries every 5s until success)
 **Fleet machines (each):**
 1. Wait for SSH + cloud-init
 2. `scp` machine-agent binary + container files
-3. Set hostname, configure systemd with `NODE_ID`, `NODE_ADDRESS`, `COORDINATOR_URL`, B2 credentials
+3. Set hostname, configure systemd with `NODE_ID`, `NODE_ADDRESS`, `COORDINATOR_URL`, B2 credentials via idempotent `override.conf` drop-in
 4. Build `platform/app-container` image, verify DRBD module (with SSH retry), `systemctl enable --now machine-agent` (with SSH retry)
 
-Note: `enable --now` (not just `start`) ensures services auto-restart on reboot — critical for crash recovery tests. SSH retry loops handle transient connection drops after heavy operations (e.g., docker build).
+Note: `enable --now` (not just `start`) ensures services auto-restart on reboot — critical for crash recovery tests. All SSH commands have retry loops (5 attempts, 10s sleep) to handle transient connection drops during cloud-init and heavy operations (docker build). The `override.conf` pattern (systemd drop-in) is idempotent — safe to re-apply on SSH retry without corrupting the base service file.
 
 ### Systemd Units
 
@@ -1126,6 +1223,48 @@ Every 60 seconds:
       → disconnectSuspendedDRBD (disconnect DRBD on both machines)
 ```
 
+### Live Migration — Primary (Layer 5.1 — coordinator-driven)
+
+```
+POST /api/users/alice/migrate {"source_machine":"fleet-1","target_machine":"fleet-3"}
+  → validates alice is "running", fleet-1 is in bipod, fleet-3 is active + not in bipod
+  → sets alice to "migrating"
+  ↓ (goroutine)
+  Step 1: Gather metadata, create operation, create target bipod in DB
+  Step 2: POST /images/alice/create         → fleet-3 (empty image, same size)
+  Step 3: Configure temporary tripod (3-node DRBD):
+          POST /images/alice/drbd/create    → fleet-3 (3-node config with fleet-1,2,3)
+          POST /images/alice/drbd/reconfigure → fleet-1 (adjust to 3-node, or force fallback)
+          POST /images/alice/drbd/reconfigure → fleet-2 (adjust to 3-node, or force fallback)
+  Step 4: Poll GET /images/alice/drbd/status → wait for fleet-3 peer UpToDate (5min timeout)
+  ── User's container keeps running throughout Steps 1-4 ──
+  Step 5: POST /containers/alice/stop       → fleet-1 (SIGTERM graceful shutdown)
+  Step 6: POST /images/alice/drbd/demote    → fleet-1
+  Step 7: POST /images/alice/drbd/promote   → fleet-3
+  Step 8: POST /containers/alice/start      → fleet-3
+  ── Downtime: Steps 5-8 (~5-15s) ──
+  Step 9: Cleanup source → 2-node bipod:
+          POST /images/alice/drbd/disconnect → fleet-1
+          DELETE /images/alice/drbd          → fleet-1
+          DELETE /images/alice               → fleet-1
+          POST /images/alice/drbd/reconfigure → fleet-3 (back to 2-node)
+          POST /images/alice/drbd/reconfigure → fleet-2 (back to 2-node)
+          RemoveBipod(fleet-1), SetBipodRole(fleet-3, primary)
+  Step 10: SetUserStatus("running"), CompleteOperation
+  Bipod: fleet-3 (primary) + fleet-2 (secondary)
+```
+
+### Live Migration — Secondary (Layer 5.1)
+
+```
+Same as primary, but:
+  - Source is the secondary machine (e.g., fleet-2)
+  - Stayer is the primary (container never stops)
+  - Steps 5-8 (container stop/demote/promote/start) are skipped entirely
+  - Step 9 uses "migrate-secondary-cleaned" checkpoint
+  - Zero user downtime — container runs on primary stayer throughout
+```
+
 ### Manual Failover (Layer 4.1 pattern, still works)
 
 ```
@@ -1241,6 +1380,26 @@ Tests coordinator crash recovery via deterministic fault injection (`FAIL_AT`) a
 | 10 | 3 | Final recovery — clean coordinator restart, reconciliation, consistency check |
 | 11 | 3 | Final consistency + cleanup (all invariants hold, B2 bucket cleaned, DB cleaned) |
 
+### Layer 5.1 — Tripod Primitive & Manual Live Migration (73 checks, 9 phases)
+
+Tests live migration via temporary tripod, crash recovery at every migration step, and system invariants. 4 Hetzner servers (1 coord + 3 fleet) + 1 Backblaze B2 bucket + 1 Supabase Postgres database. Retention timers set high (600s/1200s).
+
+| Phase | Checks | What |
+|-------|--------|------|
+| 0 | 9 | Prerequisites (coordinator, 3 machines, Postgres, schema, advisory lock) |
+| 1 | 6 | Baseline — provision alice, write test data, verify DB |
+| 2 | 10 | Primary migration happy path (data survived, bipod correct, DRBD healthy, events, consistency) |
+| 3 | 8 | Secondary migration happy path (primary unchanged, both markers intact, old secondary cleaned) |
+| 4 | 6 | Validation & edge cases (migrate to bipod member→400, non-running→409, non-existent→404, non-bipod source→400) |
+| 5 | 19 | Primary migration crash tests F34-F42 (9 fault points × {valid state + data intact} + consistency) |
+| 6 | 6 | Secondary migration crash tests F50-F54 (5 fault points × valid state + consistency) |
+| 7 | 7 | Post-crash verification (new user provision + migration after all crash tests, events/operations in DB) |
+| 8 | 2 | Final consistency & cleanup (all invariants, no stuck operations) |
+
+**14 migration fault injection points:**
+- Primary (F34-F42): migrate-target-selected, migrate-image-created, migrate-drbd-added, migrate-synced, migrate-container-stopped, migrate-source-demoted, migrate-target-promoted, migrate-container-started, migrate-source-cleaned
+- Secondary (F50-F54): migrate-target-selected, migrate-image-created, migrate-drbd-added, migrate-synced, migrate-secondary-cleaned
+
 **12 system invariants** checked by `check_consistency`:
 1. Every running user has ≥1 container
 2. Every running user has ≥1 non-stale bipod
@@ -1281,6 +1440,11 @@ phase_start/phase_result/final_result            # test framework
 crash_test step_name operation_type trigger_cmd   # fault injection + recovery + consistency check
 check_consistency label                           # verify all 12 system invariants
 wait_for_coordinator timeout                      # poll coordinator /api/fleet until responsive
+
+# Layer 5.1 additions
+db_query "SQL"                                    # SSH to coordinator + psql (with 3 retries)
+find_free_machine user_id                         # find fleet machine not in user's bipod
+wait_for_operations_settled timeout               # poll until no in_progress operations
 ```
 
 ---
@@ -1300,7 +1464,7 @@ wait_for_coordinator timeout                      # poll coordinator /api/fleet 
 - **DRBD promote-before-sync** — always promote primary before waiting for sync
 - **Protocol A** — async replication, last few seconds of writes may be lost on failover
 - **Machine statuses:** `active` → `suspect` (30s) → `dead` (60s) → `active` (resurrection)
-- **User statuses:** `registered` → `provisioning` → `running` / `failed` / `failing_over` / `running_degraded` / `reforming` / `unavailable` / `suspending` / `suspended` / `reactivating` / `evicted`
+- **User statuses:** `registered` → `provisioning` → `running` / `failed` / `failing_over` / `running_degraded` / `reforming` / `unavailable` / `suspending` / `suspended` / `reactivating` / `evicted` / `migrating`
 - **Bipod roles:** `primary`, `secondary`, `stale` (machine dead, bipod no longer valid)
 - **B2 backup key layout:** `users/{userID}/{snapshotName}.btrfs.zst` + `users/{userID}/manifest.json`
 - **Failover is idempotent** — skips users not in `running` or `running_degraded`
@@ -1323,3 +1487,13 @@ wait_for_coordinator timeout                      # poll coordinator /api/fleet 
 - **Graceful shutdown** — SIGTERM → cancel context → shutdown HTTP → close DB
 - **One external dependency** — `github.com/lib/pq` for Postgres driver (imported as `_ "github.com/lib/pq"`)
 - **Supabase Postgres via pgbouncer** — connection string uses port 6543 (transaction pooler), not direct Postgres port
+- **DRBD `--max-peers 2` at provision time** — all DRBD resources are created with `--max-peers 2` metadata, enabling later expansion to 3-node tripod for live migration
+- **Stable DRBD node-ids** — derived from hostname: fleet-1→0, fleet-2→1, fleet-3→2. Ensures consistency across reconfigures (adjust and force paths)
+- **DRBD minor allocation** — first-available per-machine from `SELECT MAX(drbd_minor)+1` on the bipods table, prevents collisions when machines have varying numbers of resources
+- **Tripod is temporary** — 3-node DRBD config exists only during migration sync phase. Cleanup step reduces back to 2-node bipod
+- **Primary migration downtime: ~5-15s** — SIGTERM grace (up to 10s) + demote/promote (~100ms) + container start (~1-5s)
+- **Secondary migration: zero user downtime** — container on primary stayer never stops; only DRBD config changes
+- **DRBDReconfigure `Role` field** — force path uses Role ("primary"/"secondary") to decide whether to run `drbdadm primary --force` after down/up
+- **Migration fail handler restarts container** — if migration fails after container stop, the fail handler restarts the container on the source machine to prevent orphaned "running" users with no container
+- **Phase 5 reconciler safety net** — ensures every "running" user has a container on its primary machine, catching edge cases missed by the fail handler
+- **Deploy uses override.conf drop-ins** — idempotent systemd configuration that survives SSH retry without corrupting the base service file

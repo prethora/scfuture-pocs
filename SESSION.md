@@ -2725,6 +2725,47 @@ DRBD 9 supports N nodes natively, but we've only ever configured 2-node resource
 - Rebalancer doesn't migrate during ongoing operations (suspend, failover, etc.)
 - Crash recovery for in-progress rebalancer-triggered migrations
 
+### Layer 5.1 Results — CLOSED
+
+**Result: 73/73 checks passing (Run #18, 2026-03-02)**
+
+| Phase | Description | Result |
+|-------|------------|--------|
+| 0 | Prerequisites | 9/9 |
+| 1 | Baseline — Provision & Verify | 6/6 |
+| 2 | Primary Migration — Happy Path | 10/10 |
+| 3 | Secondary Migration — Happy Path | 8/8 |
+| 4 | Validation & Edge Cases | 6/6 |
+| 5 | Primary Migration Crash Tests (F34-F42) | 19/19 |
+| 6 | Secondary Migration Crash Tests (F50-F54) | 6/6 |
+| 7 | Post-Crash Verification | 7/7 |
+| 8 | Final Consistency & Cleanup | 2/2 |
+
+**Key implementation details:**
+- **Tripod primitive proven**: DRBD 9 temporary 3-node config works. `drbdadm adjust` succeeds in most cases; force fallback (down/up) used when adjust fails (container briefly stopped during reconfig for primary migration).
+- **Migration protocol**: 10-step orchestration — create image → DRBD tripod → sync → container stop → demote/promote → container start → cleanup → bipod update. Both primary and secondary migration types implemented.
+- **`--max-peers 2` required**: DRBD resources must be created with `--max-peers 2` in initial metadata for later tripod expansion. This is set at provision time.
+- **Stable DRBD node-ids**: Derived from hostname (fleet-1→0, fleet-2→1, fleet-3→2) to ensure consistency across reconfigures. Dynamic "first-available" minor allocation prevents collisions.
+- **Crash recovery via 6-phase reconciler**: Extended from 5 phases (Layer 4.6) to 6. New phases handle migration resume/cancel and ensure running users have containers on their primary machines (Phase 5 safety net).
+- **`containerStopped` fail handler**: If migration fails after the container is stopped, the fail handler restarts the container on the source machine, preventing orphaned "running" users with no container.
+- **Systemd override.conf pattern**: Deploy uses idempotent `override.conf` drop-ins instead of fragile `sed`-based config, surviving transient SSH drops during deploy.
+
+**Bugs found & fixed during testing:**
+- DRBD `--max-peers` metadata incompatibility → All provisions now use `--max-peers 2`
+- DRBD node-id inconsistency across reconfigures → Stable hostname-derived node-ids
+- DRBD minor allocation collisions → First-available-minor algorithm
+- Stale tripod bipods after crash tests → Phase 3c reconciliation cleans up 3-node leftovers
+- Btrfs minimum size too small → Increased image size to 128MB
+- `db_query` empty echo false positive → `[ -n "$result" ] && echo "$result"` prevents `wc -l` returning 1 for empty results
+- Crash wait timeout too short for late-stage faults → Increased from 60s to 120s (128MB DRBD sync time)
+- Container not restarted after mid-migration failure → `containerStopped` flag + explicit restart in fail handler + Phase 5 reconciler safety net
+- `find_free_machine` failing with `set -e` → Added `|| true` to bare assignments
+- Operations `in_progress` timing race → Added `wait_for_operations_settled` poll before consistency checks
+- SSH transient drops during deploy → 5 retries with 10s sleep on all deploy SSH commands, `wait_cloud_init` decoupled from pipeline
+- `exit` in `eval` killing test script → Wrapped retry loops in subshells
+
+---
+
 #### What Has Changed Since the Original v3 Design
 
 | Original v3 Design | Our Implementation | Impact on Layer 5 |
@@ -2746,6 +2787,6 @@ Layer 4.3: Heartbeat Failure Detection           ✅ 62/62 checks
 Layer 4.4: Bipod Reformation                     ✅ 91/91 checks
 Layer 4.5: Suspension / Reactivation / Deletion  ✅ 63/63 checks
 Layer 4.6: Crash Recovery / Reconciliation       ✅ 67/67 checks
-Layer 5.1: Tripod Primitive & Manual Migration   ⬜ Next
-Layer 5.2: Rebalancer & Machine Drain            ⬜
+Layer 5.1: Tripod Primitive & Manual Migration   ✅ 73/73 checks
+Layer 5.2: Rebalancer & Machine Drain            ⬜ Next
 ```
