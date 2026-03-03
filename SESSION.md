@@ -1770,6 +1770,169 @@ Long chains make cold restores slow (each incremental must be downloaded and app
 
 ---
 
+## ⚠️⚠️⚠️ MANDATORY: Event-Based Testing (Layer 5.2+) ⚠️⚠️⚠️
+
+> **THIS IS A PROJECT-WIDE MANDATE.** Starting from Layer 5.2, ALL test suites
+> MUST use event-log verification as the primary method for confirming operation
+> completion. Status polling (checking user status in a loop) is the OLD pattern
+> and MUST NOT be used except in the one narrow case documented below.
+
+### Why Event-Based Testing
+
+In Layer 5.2, we discovered that polling user/machine status to verify operation completion is **fragile, race-prone, and unreliable**. The event log is the source of truth for what actually happened in the system. Events are:
+
+- **Persistent** — written to Postgres, queryable any time after the fact
+- **Race-free** — an event either exists or it doesn't; no transient states to miss
+- **Filterable** — `type`, `trigger`, `machine_id`, `user_id`, `since`, `success`
+- **Auditable** — provides a complete record of what happened and when
+
+### The Four Core Helpers (defined in `common.sh`)
+
+```bash
+# 1. Mark time BEFORE an operation (UTC ISO8601)
+mark_time() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# 2. Count events matching a filter
+count_events() {
+    local resp
+    resp=$(coord_api GET "/api/events/count?$1" 2>/dev/null) || echo "0"
+    echo "$resp" | jq -r '.count // 0'
+}
+
+# 3. Get full event objects matching a filter
+query_events() {
+    coord_api GET "/api/events/query?$1"
+}
+
+# 4. Wait for an event to appear (polls every 3s)
+wait_for_event() {
+    local query="$1"
+    local timeout="${2:-120}"
+    local elapsed=0
+    while [ $elapsed -lt $timeout ]; do
+        local c
+        c=$(count_events "$query")
+        if [ "${c:-0}" -gt 0 ]; then
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    return 1
+}
+```
+
+### The Mandatory Pattern
+
+**ALWAYS** mark a timestamp BEFORE starting an operation, then wait for the corresponding event with a `since` filter:
+
+```bash
+# ✅ CORRECT — event-based verification
+MIG_TS=$(mark_time)
+coord_api POST "/api/users/user-1/migrate" '{"source_machine":"...","target_machine":"..."}'
+wait_for_event "type=migration&trigger=manual&user_id=user-1&since=$MIG_TS" 120
+check "Migration completed" '[ $? -eq 0 ]'
+
+# ✅ CORRECT — waiting for multiple events
+PHASE_TS=$(mark_time)
+for i in 1 2 3 4; do
+    coord_api POST "/api/users" '{"user_id":"user-'$i'","image_size_mb":128}'
+done
+# Poll count until all 4 provisions complete
+ELAPSED=0
+while [ $ELAPSED -lt 300 ]; do
+    c=$(count_events "type=provision&success=true&since=$PHASE_TS")
+    [ "${c:-0}" -ge 4 ] && break
+    sleep 5; ELAPSED=$((ELAPSED + 5))
+done
+check "All 4 users provisioned" '[ "${c:-0}" -ge 4 ]'
+
+# ✅ CORRECT — drain completion
+DRAIN_TS=$(mark_time)
+coord_api POST "/api/fleet/fleet-3/drain"
+wait_for_event "type=drain_started&machine_id=fleet-3&since=$DRAIN_TS"
+wait_for_event "type=drain_completed&machine_id=fleet-3&since=$DRAIN_TS" 300
+```
+
+```bash
+# ❌ WRONG — status polling (DO NOT USE)
+coord_api POST "/api/users/user-1/migrate" '...'
+while true; do
+    STATUS=$(coord_api GET "/api/users/user-1" | jq -r '.status')
+    if [ "$STATUS" = "running" ]; then break; fi
+    sleep 2
+done
+
+# ❌ WRONG — sleep and check (DO NOT USE)
+coord_api POST "/api/users/user-1/migrate" '...'
+sleep 30
+STATUS=$(coord_api GET "/api/users/user-1" | jq -r '.status')
+check "Migration done" '[ "$STATUS" = "running" ]'
+
+# ❌ WRONG — event query without since (matches stale events)
+coord_api POST "/api/users/user-1/migrate" '...'
+wait_for_event "type=migration&user_id=user-1"  # ← NO since filter!
+```
+
+### The One Exception: Observing In-Flight Lock State
+
+When testing the **lock itself** (not operation completion), you need to observe that a lock is currently held. Migration events only fire at completion — too late to observe the in-flight state. In this narrow case, polling the `locked` field is correct:
+
+```bash
+# ✅ ACCEPTABLE — polling locked field to test the lock mechanism
+wait_for_locked() {
+    local USER_ID=$1 TIMEOUT=${2:-30}
+    local ELAPSED=0
+    while [ $ELAPSED -lt $TIMEOUT ]; do
+        LOCKED=$(coord_api GET "/api/users/$USER_ID" | jq -r '.locked')
+        if [ "$LOCKED" = "true" ]; then return 0; fi
+        sleep 1
+        ELAPSED=$((ELAPSED + 1))
+    done
+    return 1
+}
+
+# Start migration, then observe the lock being held
+coord_api POST "/api/users/user-1/migrate" '...'
+wait_for_locked "user-1" 30   # ← Testing the lock, not the operation
+check "User locked during migration" '[ $? -eq 0 ]'
+```
+
+This exception applies ONLY to:
+- Phase 2a (same-user mutual exclusion — need to see lock held to test 409)
+- Phase 5 (failover during migration — need to confirm lock before killing agent)
+- Phase 7B (consistency checker during migration — need lock held to test checks 10/11)
+
+### Key Rules Summary
+
+| Rule | Details |
+|------|---------|
+| **Always use `mark_time` + `since`** | Every event query MUST include a `since` filter to avoid matching stale events from previous phases |
+| **Use `wait_for_event` for completion** | NOT status polling, NOT sleep-and-check |
+| **Use `count_events` for verification** | "At least N events of type X occurred since timestamp Y" |
+| **Handle both success and timeout** | `wait_for_event` returns 0/1; handle the timeout case gracefully |
+| **Consistency check after every phase** | Non-negotiable — catches leaked state between phases |
+| **Log event counts at end of test** | Summary of all event types for debugging and audit trail |
+
+### Event Types Available
+
+| Event Type | Filter Keys | Used For |
+|------------|-------------|----------|
+| `provision` | `success`, `user_id` | User provisioning completion |
+| `migration` | `trigger` (manual/rebalancer/drain), `user_id` | Migration completion (success or failure) |
+| `lifecycle` | `user_id` | Suspend, reactivate, evict operations |
+| `failover` | `user_id`, `machine_id` | Failover events |
+| `reformation` | `user_id` | Bipod reformation events |
+| `drain_started` | `machine_id` | Drain operation began |
+| `drain_completed` | `machine_id` | Drain operation finished |
+| `drain_cancelled` | `machine_id` | Drain was cancelled |
+| `rebalancer_trigger` | — | Rebalancer decided to act |
+| `heartbeat` | `machine_id` | Machine heartbeat (for re-registration detection) |
+
+---
+
 ## 11. Drift Analysis: Layer 4.1
 
 When Layer 4.1 was completed, each fix was reviewed against the established patterns from PoCs 1-3 and the architecture to ensure no architectural drift was introduced.
