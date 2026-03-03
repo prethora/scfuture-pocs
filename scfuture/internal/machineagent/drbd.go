@@ -333,6 +333,11 @@ func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureReques
 		// Try adjust
 		result, err := runCmd("drbdadm", "adjust", resName)
 		if err == nil {
+			// Explicitly connect to any new peers — adjust may not initiate connections
+			// to peers that were added to the config but are in StandAlone state.
+			if connResult, connErr := runCmd("drbdadm", "connect", resName); connErr != nil {
+				slog.Info("drbdadm connect after adjust (non-fatal)", "component", "drbd", "user", userID, "stderr", connResult.Stderr)
+			}
 			slog.Info("DRBD reconfigured via adjust", "component", "drbd", "user", userID)
 
 			// Update in-memory state with new peer info
@@ -365,11 +370,20 @@ func (a *Agent) DRBDReconfigure(userID string, req *shared.DRBDReconfigureReques
 		runCmd("umount", mountPath)
 	}
 
-	// Down
-	runCmd("drbdadm", "down", resName)
+	// Down — must succeed before up, otherwise minor is still in use
+	result, err := runCmd("drbdadm", "down", resName)
+	if err != nil {
+		slog.Warn("drbdadm down failed, retrying after disconnect", "component", "drbd", "user", userID, "error", err)
+		// Try disconnecting peers first, then down again
+		runCmd("drbdadm", "disconnect", resName)
+		result, err = runCmd("drbdadm", "down", resName)
+		if err != nil {
+			return nil, cmdError("drbdadm down failed after reconfigure (minor still in use)", cmdString("drbdadm", "down", resName), result)
+		}
+	}
 
 	// Up (uses new config)
-	result, err := runCmd("drbdadm", "up", resName)
+	result, err = runCmd("drbdadm", "up", resName)
 	if err != nil {
 		return nil, cmdError("drbdadm up failed after reconfigure", cmdString("drbdadm", "up", resName), result)
 	}

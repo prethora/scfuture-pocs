@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"scfuture/internal/shared"
@@ -24,6 +25,8 @@ type Coordinator struct {
 	chaosMode        bool
 	chaosProbability float64
 	cancelFunc       context.CancelFunc // for graceful shutdown
+	drainDone        sync.Map           // machineID → chan struct{}, closed when drain goroutine exits
+	lastRebalanceMigration time.Time    // cooldown after rebalancer-triggered migration
 }
 
 func NewCoordinator(databaseURL, b2BucketName string) (*Coordinator, error) {
@@ -79,9 +82,19 @@ func (coord *Coordinator) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/users/{id}/migrate", coord.handleMigrateUser)
 	mux.HandleFunc("GET /api/migrations", coord.handleGetMigrations)
 
+	// Machine drain (Layer 5.2)
+	mux.HandleFunc("POST /api/fleet/{machine_id}/drain", coord.handleDrainMachine)
+	mux.HandleFunc("POST /api/fleet/{machine_id}/undrain", coord.handleUndrainMachine)
+
 	// Events & Operations (Layer 4.6)
 	mux.HandleFunc("GET /api/events", coord.handleGetEvents)
 	mux.HandleFunc("GET /api/operations", coord.handleGetOperations)
+
+	// Event query & system health (Layer 5.2 — event-log testing)
+	mux.HandleFunc("GET /api/events/query", coord.handleQueryEvents)
+	mux.HandleFunc("GET /api/events/count", coord.handleCountEvents)
+	mux.HandleFunc("GET /api/system/stable", coord.handleSystemStable)
+	mux.HandleFunc("GET /api/system/consistency", coord.handleSystemConsistency)
 }
 
 func (coord *Coordinator) GetStore() *Store {
@@ -501,7 +514,7 @@ func (coord *Coordinator) handleMigrateUser(w http.ResponseWriter, r *http.Reque
 	}
 
 	coord.store.SetUserStatus(userID, "migrating", "")
-	go coord.MigrateUser(userID, req.SourceMachine, req.TargetMachine)
+	go coord.MigrateUser(userID, req.SourceMachine, req.TargetMachine, "manual")
 
 	slog.Info("Migration started", "user_id", userID, "source", req.SourceMachine, "target", req.TargetMachine)
 	writeJSON(w, http.StatusAccepted, shared.MigrateUserResponse{
@@ -516,6 +529,394 @@ func (coord *Coordinator) handleGetMigrations(w http.ResponseWriter, r *http.Req
 		events = []MigrationEvent{}
 	}
 	writeJSON(w, http.StatusOK, events)
+}
+
+func (coord *Coordinator) handleDrainMachine(w http.ResponseWriter, r *http.Request) {
+	machineID := r.PathValue("machine_id")
+
+	machine := coord.store.GetMachine(machineID)
+	if machine == nil {
+		writeError(w, http.StatusNotFound, "machine not found")
+		return
+	}
+	if machine.Status == "draining" {
+		writeError(w, http.StatusConflict, "machine is already draining")
+		return
+	}
+	if machine.Status != "active" {
+		writeError(w, http.StatusConflict, "machine must be active to drain (current: "+machine.Status+")")
+		return
+	}
+
+	// Check minimum fleet size — need at least 2 other active machines for bipod placement
+	activeMachines := coord.store.GetActiveNonDrainingMachines()
+	otherActive := 0
+	for _, m := range activeMachines {
+		if m.MachineID != machineID {
+			otherActive++
+		}
+	}
+	if otherActive < 2 {
+		writeError(w, http.StatusConflict, "cannot drain: need at least 2 other active machines for bipod placement")
+		return
+	}
+
+	// Count users to migrate
+	userIDs := coord.store.GetUsersOnMachine(machineID)
+	runningCount := 0
+	for _, uid := range userIDs {
+		u := coord.store.GetUser(uid)
+		if u != nil && u.Status == "running" {
+			runningCount++
+		}
+	}
+
+	coord.store.SetMachineStatus(machineID, "draining")
+	coord.startDrainGoroutine(machineID)
+
+	slog.Info("Drain started", "machine_id", machineID, "users_to_migrate", runningCount)
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"machine_id":       machineID,
+		"status":           "draining",
+		"users_to_migrate": runningCount,
+	})
+}
+
+func (coord *Coordinator) handleUndrainMachine(w http.ResponseWriter, r *http.Request) {
+	machineID := r.PathValue("machine_id")
+
+	machine := coord.store.GetMachine(machineID)
+	if machine == nil {
+		writeError(w, http.StatusNotFound, "machine not found")
+		return
+	}
+	if machine.Status != "draining" {
+		writeError(w, http.StatusConflict, "machine is not draining (current: "+machine.Status+")")
+		return
+	}
+
+	// Set status to active — the drain goroutine will see this and stop picking new users
+	coord.store.SetMachineStatus(machineID, "active")
+
+	// Wait for the drain goroutine to finish (including any in-flight migration)
+	if doneCh, ok := coord.drainDone.Load(machineID); ok {
+		slog.Info("Undrain: waiting for drain goroutine to finish", "machine_id", machineID)
+		select {
+		case <-doneCh.(chan struct{}):
+			slog.Info("Undrain: drain goroutine finished", "machine_id", machineID)
+		case <-time.After(10 * time.Minute):
+			slog.Warn("Undrain: timed out waiting for drain goroutine", "machine_id", machineID)
+		}
+	}
+
+	slog.Info("Undrain: machine returned to active", "machine_id", machineID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"machine_id": machineID,
+		"status":     "active",
+	})
+}
+
+// startDrainGoroutine launches a drain goroutine with a done channel for synchronization.
+func (coord *Coordinator) startDrainGoroutine(machineID string) {
+	done := make(chan struct{})
+	coord.drainDone.Store(machineID, done)
+	go func() {
+		defer func() {
+			close(done)
+			coord.drainDone.Delete(machineID)
+		}()
+		coord.DrainMachine(machineID)
+	}()
+}
+
+// ─── Event query & system health endpoints (Layer 5.2) ───
+
+// handleQueryEvents returns filtered events.
+// Query params: type, since, user_id, machine_id, trigger, success, limit
+func (coord *Coordinator) handleQueryEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	query := `SELECT event_id, timestamp, event_type, machine_id, user_id, operation_id, details FROM events WHERE 1=1`
+	var args []interface{}
+	argN := 1
+
+	if v := q.Get("type"); v != "" {
+		query += fmt.Sprintf(` AND event_type = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("since"); v != "" {
+		query += fmt.Sprintf(` AND timestamp > $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("user_id"); v != "" {
+		query += fmt.Sprintf(` AND user_id = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("machine_id"); v != "" {
+		query += fmt.Sprintf(` AND machine_id = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("trigger"); v != "" {
+		query += fmt.Sprintf(` AND details->>'trigger' = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("success"); v != "" {
+		query += fmt.Sprintf(` AND details->>'success' = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+
+	query += ` ORDER BY timestamp ASC`
+
+	limit := 500
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	query += fmt.Sprintf(` LIMIT $%d`, argN)
+	args = append(args, limit)
+
+	rows, err := coord.store.DB().Query(query, args...)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	var events []map[string]interface{}
+	for rows.Next() {
+		var eventID int
+		var ts time.Time
+		var eventType string
+		var machineID, userID, operationID sql.NullString
+		var detailsJSON []byte
+		rows.Scan(&eventID, &ts, &eventType, &machineID, &userID, &operationID, &detailsJSON)
+
+		var details map[string]interface{}
+		json.Unmarshal(detailsJSON, &details)
+
+		events = append(events, map[string]interface{}{
+			"event_id":     eventID,
+			"timestamp":    ts,
+			"event_type":   eventType,
+			"machine_id":   machineID.String,
+			"user_id":      userID.String,
+			"operation_id": operationID.String,
+			"details":      details,
+		})
+	}
+	if events == nil {
+		events = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+// handleCountEvents returns count of matching events.
+// Query params: type, since, trigger, success, user_id, machine_id
+func (coord *Coordinator) handleCountEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	query := `SELECT COUNT(*) FROM events WHERE 1=1`
+	var args []interface{}
+	argN := 1
+
+	if v := q.Get("type"); v != "" {
+		query += fmt.Sprintf(` AND event_type = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("since"); v != "" {
+		query += fmt.Sprintf(` AND timestamp > $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("trigger"); v != "" {
+		query += fmt.Sprintf(` AND details->>'trigger' = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("success"); v != "" {
+		query += fmt.Sprintf(` AND details->>'success' = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("user_id"); v != "" {
+		query += fmt.Sprintf(` AND user_id = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+	if v := q.Get("machine_id"); v != "" {
+		query += fmt.Sprintf(` AND machine_id = $%d`, argN)
+		args = append(args, v)
+		argN++
+	}
+
+	var count int
+	if err := coord.store.DB().QueryRow(query, args...).Scan(&count); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"count": count})
+}
+
+// handleSystemStable returns whether the system is in a stable state.
+func (coord *Coordinator) handleSystemStable(w http.ResponseWriter, r *http.Request) {
+	// Count in-progress operations
+	var inProgressOps int
+	coord.store.DB().QueryRow(`SELECT COUNT(*) FROM operations WHERE status = 'in_progress'`).Scan(&inProgressOps)
+
+	// Count users in transient states
+	transientStates := []string{"provisioning", "failing_over", "reforming", "suspending", "reactivating", "evicting", "migrating"}
+	var transientUsers int
+	for _, s := range transientStates {
+		transientUsers += coord.store.CountUsersByStatus(s)
+	}
+
+	// Count draining machines
+	drainingCount := len(coord.store.GetDrainingMachines())
+
+	stable := inProgressOps == 0 && transientUsers == 0
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"stable":            stable,
+		"in_progress_ops":   inProgressOps,
+		"transient_users":   transientUsers,
+		"draining_machines": drainingCount,
+	})
+}
+
+// handleSystemConsistency runs server-side consistency checks.
+func (coord *Coordinator) handleSystemConsistency(w http.ResponseWriter, r *http.Request) {
+	type checkResult struct {
+		Name   string `json:"name"`
+		Pass   bool   `json:"pass"`
+		Detail string `json:"detail,omitempty"`
+	}
+	var results []checkResult
+	allPass := true
+
+	addCheck := func(name string, pass bool, detail string) {
+		results = append(results, checkResult{Name: name, Pass: pass, Detail: detail})
+		if !pass {
+			allPass = false
+		}
+	}
+
+	db := coord.store.DB()
+
+	// Check 1: Running users have exactly 2 non-stale bipods
+	rows, _ := db.Query(`
+		SELECT u.user_id, COUNT(b.machine_id)
+		FROM users u
+		LEFT JOIN bipods b ON u.user_id = b.user_id AND b.role != 'stale'
+		WHERE u.status = 'running'
+		GROUP BY u.user_id
+		HAVING COUNT(b.machine_id) != 2
+	`)
+	var badBipodUsers []string
+	if rows != nil {
+		for rows.Next() {
+			var uid string
+			var cnt int
+			rows.Scan(&uid, &cnt)
+			badBipodUsers = append(badBipodUsers, fmt.Sprintf("%s(%d)", uid, cnt))
+		}
+		rows.Close()
+	}
+	if len(badBipodUsers) == 0 {
+		addCheck("running_users_have_2_bipods", true, "")
+	} else {
+		addCheck("running_users_have_2_bipods", false, fmt.Sprintf("bad: %v", badBipodUsers))
+	}
+
+	// Check 2: No same-machine bipod pairs
+	var dupCount int
+	db.QueryRow(`SELECT COUNT(*) FROM (SELECT user_id, machine_id FROM bipods WHERE role != 'stale' GROUP BY user_id, machine_id HAVING COUNT(*) > 1) t`).Scan(&dupCount)
+	addCheck("no_same_machine_bipods", dupCount == 0, fmt.Sprintf("duplicates: %d", dupCount))
+
+	// Check 3: No duplicate DRBD ports
+	var dupPorts int
+	db.QueryRow(`SELECT COUNT(*) FROM (SELECT port FROM users WHERE status != 'evicted' AND port > 0 GROUP BY port HAVING COUNT(*) > 1) t`).Scan(&dupPorts)
+	addCheck("no_duplicate_ports", dupPorts == 0, fmt.Sprintf("duplicate_ports: %d", dupPorts))
+
+	// Check 4: No duplicate DRBD minors per machine
+	var dupMinors int
+	db.QueryRow(`SELECT COUNT(*) FROM (SELECT machine_id, minor FROM bipods WHERE role != 'stale' AND minor > 0 GROUP BY machine_id, minor HAVING COUNT(*) > 1) t`).Scan(&dupMinors)
+	addCheck("no_duplicate_minors", dupMinors == 0, fmt.Sprintf("duplicate_minors: %d", dupMinors))
+
+	// Check 5: No users stuck in transient states
+	var stuckCount int
+	db.QueryRow(`SELECT COUNT(*) FROM users WHERE status IN ('provisioning','failing_over','reforming','suspending','reactivating','evicting','migrating')`).Scan(&stuckCount)
+	addCheck("no_stuck_transient_users", stuckCount == 0, fmt.Sprintf("stuck: %d", stuckCount))
+
+	// Check 6: No operations stuck in_progress
+	var stuckOps int
+	db.QueryRow(`SELECT COUNT(*) FROM operations WHERE status = 'in_progress'`).Scan(&stuckOps)
+	addCheck("no_stuck_operations", stuckOps == 0, fmt.Sprintf("stuck_ops: %d", stuckOps))
+
+	// Check 7: Suspended users have 0 running containers (check via machine agents)
+	var suspendedWithContainers []string
+	suspendedUsers := coord.store.GetUsersByStatus("suspended")
+	for _, u := range suspendedUsers {
+		bipods := coord.store.GetBipods(u.UserID)
+		for _, b := range bipods {
+			if b.Role == "stale" {
+				continue
+			}
+			m := coord.store.GetMachine(b.MachineID)
+			if m == nil {
+				continue
+			}
+			client := NewMachineClient(m.Address)
+			status, err := client.ContainerStatus(u.UserID)
+			if err == nil && status.Running {
+				suspendedWithContainers = append(suspendedWithContainers, u.UserID)
+				break
+			}
+		}
+	}
+	addCheck("suspended_no_containers", len(suspendedWithContainers) == 0,
+		fmt.Sprintf("suspended_with_containers: %v", suspendedWithContainers))
+
+	// Check 8: Evicted users have 0 non-stale bipods
+	var evictedWithBipods int
+	db.QueryRow(`SELECT COUNT(DISTINCT u.user_id) FROM users u JOIN bipods b ON u.user_id = b.user_id WHERE u.status = 'evicted' AND b.role != 'stale'`).Scan(&evictedWithBipods)
+	addCheck("evicted_no_bipods", evictedWithBipods == 0, fmt.Sprintf("evicted_with_bipods: %d", evictedWithBipods))
+
+	// Check 9: Running users have a running container on exactly one machine
+	var runningNoContainer []string
+	runningUsers := coord.store.GetUsersByStatus("running")
+	for _, u := range runningUsers {
+		bipods := coord.store.GetBipods(u.UserID)
+		containerCount := 0
+		for _, b := range bipods {
+			if b.Role == "stale" {
+				continue
+			}
+			m := coord.store.GetMachine(b.MachineID)
+			if m == nil {
+				continue
+			}
+			client := NewMachineClient(m.Address)
+			status, err := client.ContainerStatus(u.UserID)
+			if err == nil && status.Running {
+				containerCount++
+			}
+		}
+		if containerCount != 1 {
+			runningNoContainer = append(runningNoContainer, fmt.Sprintf("%s(%d)", u.UserID, containerCount))
+		}
+	}
+	addCheck("running_users_have_1_container", len(runningNoContainer) == 0,
+		fmt.Sprintf("bad: %v", runningNoContainer))
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pass":   allPass,
+		"checks": results,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

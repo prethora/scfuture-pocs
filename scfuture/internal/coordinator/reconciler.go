@@ -36,7 +36,10 @@ func (coord *Coordinator) Reconcile() {
 	// Phase 5: Ensure running users have containers on their primary machine
 	coord.reconcilePhase5EnsureContainers(logger, machineStatuses)
 
-	// Phase 6: Log completion
+	// Phase 6b: Resume drains for online draining machines
+	coord.reconcilePhase6bResumeDrains(logger, machineStatuses)
+
+	// Phase 7: Log completion
 	logger.Info("Reconciliation complete",
 		"duration_ms", time.Since(start).Milliseconds(),
 		"operations_resumed", resumed,
@@ -321,6 +324,30 @@ func (coord *Coordinator) reconcilePhase3ResumeOperations(logger *slog.Logger, m
 					"user_id", u.UserID)
 				coord.store.SetUserStatus(u.UserID, "running", "coordinator crashed before migration operation created")
 			}
+		}
+	}
+
+	// Handle orphaned operations: in_progress but user is in a terminal state.
+	// This can happen if CompleteOperation/FailOperation fails silently (e.g., DB error).
+	allOps, _ := coord.store.GetIncompleteOperations()
+	userMap := make(map[string]*User)
+	for _, u := range users {
+		userMap[u.UserID] = u
+	}
+	for _, op := range allOps {
+		u := userMap[op.UserID]
+		if u == nil {
+			logger.Warn("[Phase 3] Operation for unknown user — cancelling",
+				"op_id", op.OperationID, "user_id", op.UserID)
+			coord.store.FailOperation(op.OperationID, "user not found during reconciliation")
+			continue
+		}
+		// If the user is in a non-transient state, the operation is orphaned
+		switch u.Status {
+		case "running", "registered", "suspended", "evicted", "failed":
+			logger.Warn("[Phase 3] Orphaned operation — user already in terminal state",
+				"op_id", op.OperationID, "user_id", op.UserID, "user_status", u.Status, "op_type", op.Type)
+			coord.store.FailOperation(op.OperationID, "orphaned: user in "+u.Status+" state during reconciliation")
 		}
 	}
 
@@ -979,6 +1006,21 @@ func (coord *Coordinator) reconcilePhase5EnsureContainers(logger *slog.Logger, m
 		client := NewMachineClient(mr.Address)
 		if _, err := client.ContainerStart(u.UserID); err != nil {
 			logger.Error("[Phase 5] Failed to start container", "user_id", u.UserID, "error", err)
+		}
+	}
+}
+
+// reconcilePhase6bResumeDrains re-launches drain goroutines for machines that were draining when the coordinator crashed.
+func (coord *Coordinator) reconcilePhase6bResumeDrains(logger *slog.Logger, machineStatuses map[string]*machineReality) {
+	drainingMachines := coord.store.GetDrainingMachines()
+	for _, machine := range drainingMachines {
+		mr := machineStatuses[machine.MachineID]
+		if mr != nil && mr.Online {
+			logger.Info("[RECONCILE] Resuming drain for online draining machine", "machine_id", machine.MachineID)
+			coord.startDrainGoroutine(machine.MachineID)
+		} else {
+			logger.Warn("[RECONCILE] Draining machine is offline, marking dead", "machine_id", machine.MachineID)
+			coord.store.SetMachineStatus(machine.MachineID, "dead")
 		}
 	}
 }

@@ -15,12 +15,14 @@ func (coord *Coordinator) ProvisionUser(userID string) {
 	logger := slog.With("user_id", userID, "component", "provisioner")
 
 	opID := generateOpID()
+	provisionStart := time.Now()
 
 	fail := func(step string, err error) {
 		msg := fmt.Sprintf("%s: %v", step, err)
 		logger.Error("Provisioning failed", "step", step, "error", err)
 		coord.store.SetUserStatus(userID, "failed", msg)
 		coord.store.FailOperation(opID, msg)
+		coord.store.RecordProvisionEvent(userID, "", false, msg, time.Since(provisionStart).Milliseconds())
 	}
 
 	retry := func(step string, fn func() error) error {
@@ -221,6 +223,7 @@ func (coord *Coordinator) ProvisionUser(userID string) {
 	// ── Step 8: Mark running ──
 	coord.store.SetUserStatus(userID, "running", "")
 	_ = coord.store.CompleteOperation(opID)
+	coord.store.RecordProvisionEvent(userID, primary.MachineID, true, "", time.Since(provisionStart).Milliseconds())
 	logger.Info("Provisioning complete — user is running")
 }
 

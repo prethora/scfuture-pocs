@@ -53,6 +53,7 @@ func main() {
 	coordinator.StartHealthChecker(coord.GetStore(), coordinator.NewMachineClient(""), coord)
 	coordinator.StartReformer(coord.GetStore(), coord)
 	coordinator.StartRetentionEnforcer(coord.GetStore(), coord)
+	coordinator.StartRebalancer(coord.GetStore(), coord)
 
 	// ── Step 5: Start HTTP server ──
 	mux := http.NewServeMux()

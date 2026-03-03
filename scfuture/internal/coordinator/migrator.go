@@ -14,7 +14,7 @@ const (
 
 // MigrateUser drives the live migration of a user from one machine to another.
 // Runs in its own goroutine, launched by handleMigrateUser.
-func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID string) {
+func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID, trigger string) {
 	start := time.Now()
 	logger := slog.With("user_id", userID, "component", "migrator",
 		"source", sourceMachineID, "target", targetMachineID)
@@ -30,6 +30,13 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 	var reconfigMethod string
 	var containerStopped bool       // tracks if container was stopped (for fail handler recovery)
 	var sourceClient *MachineClient // declared early so fail closure can access it
+	var targetClient *MachineClient // declared early so fail closure can clean up target
+	var stayerClient *MachineClient // declared early so fail closure can restore stayer
+	var targetBipodCreated bool     // true after CreateBipod — guards RemoveBipod in fail handler
+	var tripodConfigured bool       // true after source+stayer reconfigured to 3-node
+	var originalBipodNodes []shared.DRBDNode
+	var user *User
+	var sourceBipod *Bipod
 
 	fail := func(step string, err error) {
 		msg := fmt.Sprintf("%s: %v", step, err)
@@ -43,6 +50,63 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 			}
 		}
 
+		// Clean up target bipod if it was created during this migration.
+		if targetBipodCreated {
+			if targetClient != nil {
+				logger.Info("Cleaning up target machine after migration failure", "target", targetMachineID)
+				if _, disconnErr := targetClient.DRBDDisconnect(userID); disconnErr != nil {
+					logger.Warn("Target DRBD disconnect during cleanup failed (continuing)", "error", disconnErr)
+				}
+				if destroyErr := targetClient.DRBDDestroy(userID); destroyErr != nil {
+					logger.Warn("Target DRBD destroy during cleanup failed (continuing)", "error", destroyErr)
+				}
+				if delErr := targetClient.DeleteUser(userID); delErr != nil {
+					logger.Warn("Target user delete during cleanup failed (continuing)", "error", delErr)
+				}
+			}
+			coord.store.RemoveBipod(userID, targetMachineID)
+		}
+
+		// If source/stayer were reconfigured to tripod (3-node), restore them to original 2-node.
+		// This prevents stale 3-node configs that can cause minor collisions on future migrations.
+		if tripodConfigured && len(originalBipodNodes) == 2 {
+			logger.Info("Restoring source and stayer to original 2-node DRBD config")
+			var srcRole, stRole string
+			if sourceBipod.Role == "primary" {
+				srcRole = "primary"
+				stRole = "secondary"
+			} else {
+				srcRole = "secondary"
+				stRole = "primary"
+			}
+			// Try adjust first (non-destructive), fall back to force only if adjust fails.
+			// adjust can remove the third peer without taking the resource down.
+			if sourceClient != nil {
+				srcReq := &shared.DRBDReconfigureRequest{
+					Nodes: originalBipodNodes, Port: user.DRBDPort, Force: false, Role: srcRole,
+				}
+				if _, rErr := sourceClient.DRBDReconfigure(userID, srcReq); rErr != nil {
+					logger.Warn("Adjust failed restoring source, trying force", "error", rErr)
+					srcReq.Force = true
+					if _, rErr2 := sourceClient.DRBDReconfigure(userID, srcReq); rErr2 != nil {
+						logger.Warn("Failed to restore source to 2-node config (continuing)", "error", rErr2)
+					}
+				}
+			}
+			if stayerClient != nil {
+				stReq := &shared.DRBDReconfigureRequest{
+					Nodes: originalBipodNodes, Port: user.DRBDPort, Force: false, Role: stRole,
+				}
+				if _, rErr := stayerClient.DRBDReconfigure(userID, stReq); rErr != nil {
+					logger.Warn("Adjust failed restoring stayer, trying force", "error", rErr)
+					stReq.Force = true
+					if _, rErr2 := stayerClient.DRBDReconfigure(userID, stReq); rErr2 != nil {
+						logger.Warn("Failed to restore stayer to 2-node config (continuing)", "error", rErr2)
+					}
+				}
+			}
+		}
+
 		coord.store.SetUserStatus(userID, "running", msg)
 		_ = coord.store.RecordMigrationEvent(MigrationEvent{
 			UserID:        userID,
@@ -52,6 +116,7 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 			Success:       false,
 			Error:         msg,
 			Method:        reconfigMethod,
+			Trigger:       trigger,
 			DurationMS:    time.Since(start).Milliseconds(),
 			Timestamp:     time.Now(),
 		})
@@ -67,14 +132,14 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 	}
 
 	// ── Step 1: Determine migration type and gather metadata ──
-	user := coord.store.GetUser(userID)
+	user = coord.store.GetUser(userID)
 	if user == nil {
 		fail("lookup", fmt.Errorf("user not found"))
 		return
 	}
 
 	bipods := coord.store.GetBipods(userID)
-	var sourceBipod, stayerBipod *Bipod
+	var stayerBipod *Bipod
 	var stayerMachineID string
 	var migrationType string
 
@@ -137,6 +202,7 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 	})
 
 	coord.store.CreateBipod(userID, targetMachineID, "secondary", targetMinor)
+	targetBipodCreated = true
 
 	logger.Info("Migration started",
 		"type", migrationType,
@@ -151,8 +217,24 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 	stayerAddr := stripPort(stayerMachine.Address)
 
 	sourceClient = NewMachineClient(sourceMachine.Address)
-	targetClient := NewMachineClient(targetMachine.Address)
-	stayerClient := NewMachineClient(stayerMachine.Address)
+	targetClient = NewMachineClient(targetMachine.Address)
+	stayerClient = NewMachineClient(stayerMachine.Address)
+
+	// Build original 2-node config for fail handler restoration
+	originalBipodNodes = []shared.DRBDNode{
+		{
+			Hostname: sourceMachineID,
+			Minor:    sourceBipod.DRBDMinor,
+			Disk:     sourceBipod.LoopDevice,
+			Address:  sourceAddr,
+		},
+		{
+			Hostname: stayerMachineID,
+			Minor:    stayerBipod.DRBDMinor,
+			Disk:     stayerBipod.LoopDevice,
+			Address:  stayerAddr,
+		},
+	}
 
 	// ── Step 2: Create image on target ──
 	var targetLoop string
@@ -167,7 +249,6 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 	if err != nil {
 		fail("target_image", err)
 		coord.store.FailOperation(opID, "target image: "+err.Error())
-		coord.store.RemoveBipod(userID, targetMachineID)
 		return
 	}
 	coord.store.SetBipodLoopDevice(userID, targetMachineID, targetLoop)
@@ -209,8 +290,6 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 	if err != nil {
 		fail("drbd_target_create", err)
 		coord.store.FailOperation(opID, "drbd target create: "+err.Error())
-		targetClient.DeleteUser(userID)
-		coord.store.RemoveBipod(userID, targetMachineID)
 		return
 	}
 
@@ -244,11 +323,9 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 			if stopErr := sourceClient.ContainerStop(userID); stopErr != nil {
 				fail("source_container_stop_for_reconfig", stopErr)
 				coord.store.FailOperation(opID, "container stop for reconfig: "+stopErr.Error())
-				targetClient.DRBDDestroy(userID)
-				targetClient.DeleteUser(userID)
-				coord.store.RemoveBipod(userID, targetMachineID)
 				return
 			}
+			containerStopped = true
 		}
 
 		sourceReconfigReq.Force = true
@@ -256,12 +333,6 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 		if err != nil {
 			fail("source_force_reconfig", err)
 			coord.store.FailOperation(opID, "source force reconfig: "+err.Error())
-			if migrationType == "primary" {
-				sourceClient.ContainerStart(userID)
-			}
-			targetClient.DRBDDestroy(userID)
-			targetClient.DeleteUser(userID)
-			coord.store.RemoveBipod(userID, targetMachineID)
 			return
 		}
 
@@ -271,8 +342,12 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 				coord.store.FailOperation(opID, "container restart after reconfig: "+startErr.Error())
 				return
 			}
+			containerStopped = false // container restarted successfully
 		}
 	}
+
+	// Source is now running 3-node config; mark so fail handler can restore if needed.
+	tripodConfigured = true
 
 	// Try adjust on stayer
 	stayerReconfigReq := &shared.DRBDReconfigureRequest{
@@ -488,6 +563,11 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 		logger.Error("Failed to complete operation in DB", "op_id", opID, "error", err)
 	}
 
+	// Update ActiveAgents so rebalancer sees correct counts before next heartbeat
+	if migrationType == "primary" {
+		coord.store.AdjustActiveAgents(sourceMachineID, targetMachineID)
+	}
+
 	if err := coord.store.RecordMigrationEvent(MigrationEvent{
 		UserID:        userID,
 		SourceMachine: sourceMachineID,
@@ -495,6 +575,7 @@ func (coord *Coordinator) MigrateUser(userID, sourceMachineID, targetMachineID s
 		MigrationType: migrationType,
 		Success:       true,
 		Method:        reconfigMethod,
+		Trigger:       trigger,
 		DurationMS:    time.Since(start).Milliseconds(),
 		Timestamp:     time.Now(),
 	}); err != nil {

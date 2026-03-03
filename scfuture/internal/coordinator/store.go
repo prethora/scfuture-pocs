@@ -53,7 +53,8 @@ type MigrationEvent struct {
 	MigrationType string    `json:"migration_type"` // "primary" or "secondary"
 	Success       bool      `json:"success"`
 	Error         string    `json:"error,omitempty"`
-	Method        string    `json:"method,omitempty"` // "adjust" or "down_up"
+	Method        string    `json:"method,omitempty"`  // "adjust" or "down_up"
+	Trigger       string    `json:"trigger,omitempty"` // "manual", "rebalancer", "drain"
 	DurationMS    int64     `json:"duration_ms"`
 	Timestamp     time.Time `json:"timestamp"`
 }
@@ -564,7 +565,15 @@ func (s *Store) SetBipodRole(userID, machineID, role string) {
 		return
 	}
 	b.Role = role
-	s.db.Exec(`UPDATE bipods SET role=$1 WHERE user_id=$2 AND machine_id=$3`, role, userID, machineID)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err = s.db.Exec(`UPDATE bipods SET role=$1 WHERE user_id=$2 AND machine_id=$3`, role, userID, machineID)
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	slog.Error("SetBipodRole failed after retries", "user_id", userID, "machine_id", machineID, "role", role, "error", err)
 }
 
 func (s *Store) GetBipods(userID string) []*Bipod {
@@ -585,7 +594,15 @@ func (s *Store) RemoveBipod(userID, machineID string) {
 	defer s.mu.Unlock()
 	key := userID + ":" + machineID
 	delete(s.bipods, key)
-	s.db.Exec(`DELETE FROM bipods WHERE user_id=$1 AND machine_id=$2`, userID, machineID)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err = s.db.Exec(`DELETE FROM bipods WHERE user_id=$1 AND machine_id=$2`, userID, machineID)
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	slog.Error("RemoveBipod failed after retries", "user_id", userID, "machine_id", machineID, "error", err)
 }
 
 func (s *Store) ClearUserBipods(userID string) {
@@ -711,6 +728,21 @@ func (s *Store) SelectOneSecondary(excludeMachineIDs []string) (*Machine, error)
 	return &result, nil
 }
 
+// AdjustActiveAgents adjusts ActiveAgents for source and target after a migration.
+// This prevents the rebalancer from making decisions on stale heartbeat data.
+func (s *Store) AdjustActiveAgents(sourceMachineID, targetMachineID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m, ok := s.machines[sourceMachineID]; ok && m.ActiveAgents > 0 {
+		m.ActiveAgents--
+		s.db.Exec(`UPDATE machines SET active_agents=$1 WHERE machine_id=$2`, m.ActiveAgents, m.MachineID)
+	}
+	if m, ok := s.machines[targetMachineID]; ok {
+		m.ActiveAgents++
+		s.db.Exec(`UPDATE machines SET active_agents=$1 WHERE machine_id=$2`, m.ActiveAgents, m.MachineID)
+	}
+}
+
 // ─── Health and query methods ───
 
 func (s *Store) CheckMachineHealth(suspectThreshold, deadThreshold time.Duration) []string {
@@ -731,6 +763,11 @@ func (s *Store) CheckMachineHealth(suspectThreshold, deadThreshold time.Duration
 			newStatus = "suspect"
 		default:
 			newStatus = "active"
+		}
+
+		// Preserve "draining" status for machines with healthy heartbeats
+		if m.Status == "draining" && newStatus == "active" {
+			newStatus = "draining"
 		}
 
 		if newStatus != m.Status {
@@ -846,12 +883,28 @@ func (s *Store) UpdateOperationStep(opID, step string) {
 }
 
 func (s *Store) CompleteOperation(opID string) error {
-	_, err := s.db.Exec(`UPDATE operations SET status='complete', completed_at=NOW() WHERE operation_id=$1`, opID)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err = s.db.Exec(`UPDATE operations SET status='complete', completed_at=NOW() WHERE operation_id=$1`, opID)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	slog.Error("CompleteOperation failed after retries", "op_id", opID, "error", err)
 	return err
 }
 
 func (s *Store) FailOperation(opID, errMsg string) {
-	s.db.Exec(`UPDATE operations SET status='failed', error=$1, completed_at=NOW() WHERE operation_id=$2`, errMsg, opID)
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err = s.db.Exec(`UPDATE operations SET status='failed', error=$1, completed_at=NOW() WHERE operation_id=$2`, errMsg, opID)
+		if err == nil {
+			return
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	slog.Error("FailOperation failed after retries", "op_id", opID, "error", err)
 }
 
 func (s *Store) CancelOperation(opID string) {
@@ -1044,6 +1097,7 @@ func (s *Store) RecordMigrationEvent(event MigrationEvent) error {
 		"success":        event.Success,
 		"error":          event.Error,
 		"method":         event.Method,
+		"trigger":        event.Trigger,
 		"duration_ms":    event.DurationMS,
 	}
 	return s.RecordEvent("migration", event.SourceMachine, event.UserID, "", details)
@@ -1082,10 +1136,129 @@ func (s *Store) GetMigrationEvents() []MigrationEvent {
 		if v, ok := details["method"].(string); ok {
 			me.Method = v
 		}
+		if v, ok := details["trigger"].(string); ok {
+			me.Trigger = v
+		}
 		if v, ok := details["duration_ms"].(float64); ok {
 			me.DurationMS = int64(v)
 		}
 		result = append(result, me)
+	}
+	return result
+}
+
+// ─── Provision, drain, rebalancer events (Layer 5.2) ───
+
+func (s *Store) RecordProvisionEvent(userID, machineID string, success bool, errMsg string, durationMS int64) {
+	details := map[string]interface{}{
+		"machine_id":  machineID,
+		"success":     success,
+		"error":       errMsg,
+		"duration_ms": durationMS,
+	}
+	_ = s.RecordEvent("provision", machineID, userID, "", details)
+}
+
+func (s *Store) RecordDrainEvent(machineID, subtype string, details map[string]interface{}) {
+	if details == nil {
+		details = map[string]interface{}{}
+	}
+	details["machine_id"] = machineID
+	_ = s.RecordEvent("drain_"+subtype, machineID, "", "", details)
+}
+
+func (s *Store) RecordRebalancerEvent(action string, details map[string]interface{}) {
+	if details == nil {
+		details = map[string]interface{}{}
+	}
+	_ = s.RecordEvent("rebalancer_"+action, "", "", "", details)
+}
+
+// ─── Rebalancer & drain query methods (Layer 5.2) ───
+
+func (s *Store) GetMigratableUsersOnMachine(machineID string, stabilizationPeriod time.Duration) []*User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	cutoff := time.Now().Add(-stabilizationPeriod)
+	seen := make(map[string]bool)
+	var result []*User
+
+	for _, b := range s.bipods {
+		if b.MachineID != machineID || b.Role == "stale" || seen[b.UserID] {
+			continue
+		}
+		seen[b.UserID] = true
+		u := s.users[b.UserID]
+		if u == nil || u.Status != "running" {
+			continue
+		}
+		if u.StatusChangedAt.After(cutoff) {
+			continue // recently migrated, skip (stabilization period)
+		}
+		uCopy := *u
+		result = append(result, &uCopy)
+	}
+	return result
+}
+
+func (s *Store) GetUserBipodRoleOnMachine(userID, machineID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key := userID + ":" + machineID
+	if b, ok := s.bipods[key]; ok && b.Role != "stale" {
+		return b.Role
+	}
+	return ""
+}
+
+func (s *Store) CountUsersByStatus(status string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, u := range s.users {
+		if u.Status == status {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *Store) GetUsersByStatus(status string) []*User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*User
+	for _, u := range s.users {
+		if u.Status == status {
+			uCopy := *u
+			result = append(result, &uCopy)
+		}
+	}
+	return result
+}
+
+func (s *Store) GetDrainingMachines() []*Machine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Machine
+	for _, m := range s.machines {
+		if m.Status == "draining" {
+			mCopy := *m
+			result = append(result, &mCopy)
+		}
+	}
+	return result
+}
+
+func (s *Store) GetActiveNonDrainingMachines() []*Machine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result []*Machine
+	for _, m := range s.machines {
+		if m.Status == "active" {
+			mCopy := *m
+			result = append(result, &mCopy)
+		}
 	}
 	return result
 }
